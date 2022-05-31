@@ -1,0 +1,1312 @@
+---
+title: "CasteRNA_v6.1_Rmarkdown"
+author: "Sam Arsenault"
+date: "05/18/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Interplay between Caste, Supergene Status, and Social Form in <i>Solenopsis invicta</i>
+This is an R markdown document illustrating the bioinformatic methods used to generate the results for the manuscript by Arsenault et al. entitled "Direct and Indirect effects of a social supergene".
+
+If you have any questions about this document, please direct them to Sam Arsenault at samarsenault93@gmail.com or Brendan G. Hunt at brendan.hunt@gmail.com
+
+```{r pre-clean, echo=FALSE}
+rm(list=ls())
+setwd("~/Desktop/CasteRNA_analysis")
+
+## Note: Output all relevent results figures and data.frames to ~/Desktop/CasteRNA_analysis/Results_v6
+```
+
+
+## Load in Relevant Libraries
+```{r library_load,error=FALSE,warning=FALSE,tidy=TRUE,message=FALSE}
+library(edgeR) 
+library(UpSetR)
+library(readr)
+library(karyoploteR)
+library(ggplot2)
+library(topGO)
+library(gridExtra)
+library(eulerr)
+library(cowplot)
+library(nVennR)
+library(matrixStats)
+library(purrr)
+library(tibble)
+library(openxlsx)
+```
+
+## General Information Load  
+```{r info dump}
+## Load in the counts file generated using the 2-pass method from STAR
+temp = list.files(path="~/Desktop/CasteRNA_analysis/Counts_Data2/",full.names = TRUE) ## Get the file names from teh counts_data2 folder
+temp2 <- sapply(strsplit(list.files(path="~/Desktop/CasteRNA_analysis/Counts_Data2/"), split='.', fixed=TRUE), function(x) (x[1])) ## extract the working ID from the file name for downstream use
+myfiles = lapply(temp, read.delim,header=F) ## load all of the tsv files listed in temp into seperate sub-data.frames of my_files
+myfiles_new <- myfiles ## save a copy
+# Note: Each File is saved as myfiles[[x]] as a data.frame
+
+## merge first two columns into identifier column and then extract the proper counts column from the inputs
+for (i in 1:115){
+  if (grepl("^G_",temp2[i])) {
+    colnames(myfiles_new[[i]])[4] <- paste(temp2[i],"_counts",sep="")
+    myfiles_new[[i]] <- myfiles_new[[i]][,c(1,4)] ## Extracts the fourth column of worker gaster libraries as they are reverse-stranded
+    cat("Extracted 4th column of ",temp2[i],"\n")
+  } else {
+    colnames(myfiles_new[[i]])[2] <- paste(temp2[i],"_counts",sep="")
+    myfiles_new[[i]] <- myfiles_new[[i]][,c(1,2)] ## Extracts the second column of worker brain and all gyne libraries as they are unstranded
+    cat("Extracted 2nd column of ",temp2[i],"\n")
+  }
+}
+
+## merge all data.frames by ID and reformat into gene_data.frame
+merged <- Reduce(function(...) merge(..., by='V1', all.x=FALSE), myfiles_new) ## merges all of the sub-data.frames into one data.frame based on the geneID (V1)
+row.names(merged) <- merged$V1
+x1 <- merged[5:16318,2:116] ## Remove the geneID row (now embedded in row.names) and the first four rows from each library (unmapped metrics, etc)
+
+
+## Load in the model matrix containing information formatted for GLM comparisons and then add column for pairwise
+adv_group <- read.delim("/Users/samarsenault/Desktop/CasteRNA_analysis/Sinv_model_matrix2.tsv",row.names = 1,sep = "\t")
+adv_group$pw_tag <- paste(adv_group$Caste,adv_group$Tissue,adv_group$Origin_Colony,adv_group$Adopted,adv_group$Genotype,sep=".")
+head(adv_group)
+
+## Load in the annotation information from a bed file
+Sinv_annot <- read_delim("~/Desktop/CasteRNA_analysis/SINVBB1_gene.bed", 
+                         "\t", escape_double = FALSE, col_names = FALSE, 
+                         trim_ws = TRUE)
+row.names(Sinv_annot) <- Sinv_annot$X4 ## Rename the rows of the this variable with gene names
+colnames(Sinv_annot) <- c("chr","start","end","gene","LOC","description") ## rename the columns with better description
+head(Sinv_annot)
+
+
+```
+
+
+## Analysis after breaking everything up by tissue for coverage filtration
+```{r analysis}
+
+## Load in Gyne Data
+x_gyne <- x1[,1:63]
+
+adv_group_gyne <- adv_group[1:63,]
+
+## Split by Tissue
+x_gyne_brain <- x_gyne[,adv_group_gyne$Tissue=="Brain"]
+x_gyne_ovary <- x_gyne[,adv_group_gyne$Tissue=="Ovary"]
+
+adv_group_gyne_brain <- adv_group_gyne[adv_group_gyne$Tissue=="Brain",]
+adv_group_gyne_ovary <- adv_group_gyne[adv_group_gyne$Tissue=="Ovary",]
+
+y_gyne_brain_pw <- DGEList(x_gyne_brain,group = adv_group_gyne_brain$pw_tag)
+y_gyne_ovary_pw <- DGEList(x_gyne_ovary,group = adv_group_gyne_ovary$pw_tag)
+
+## Define the model matrix 
+design_gyne_brain_pw <- model.matrix(~0+adv_group_gyne_brain$pw_tag,data=y_gyne_brain_pw$samples)
+colnames(design_gyne_brain_pw) <- levels(y_gyne_brain_pw$samples$group)
+
+design_gyne_ovary_pw <- model.matrix(~0+adv_group_gyne_ovary$pw_tag,data=y_gyne_ovary_pw$samples)
+colnames(design_gyne_ovary_pw) <- levels(y_gyne_ovary_pw$samples$group)
+
+## Filter out low count genes
+y_gyne_brain_pw <- y_gyne_brain_pw[filterByExpr(y_gyne_brain_pw, design_gyne_brain_pw), , keep.lib.sizes=FALSE]
+y_gyne_ovary_pw <- y_gyne_ovary_pw[filterByExpr(y_gyne_ovary_pw, design_gyne_ovary_pw), , keep.lib.sizes=FALSE]
+
+## Normalize samples by library size
+y_gyne_brain_pw <- calcNormFactors(y_gyne_brain_pw)
+y_gyne_ovary_pw <- calcNormFactors(y_gyne_ovary_pw)
+
+## Begin Computing Differential Expression
+y_gyne_brain_pw <- estimateDisp(y_gyne_brain_pw,design_gyne_brain_pw)
+y_gyne_ovary_pw <- estimateDisp(y_gyne_ovary_pw,design_gyne_ovary_pw)
+
+## QLM Fit and DE analysis
+fit_gyne_brain_pw <- glmQLFit(y_gyne_brain_pw,design_gyne_brain_pw)
+fit_gyne_ovary_pw <- glmQLFit(y_gyne_ovary_pw,design_gyne_ovary_pw)
+
+gyne.brain.pw.contrasts <- makeContrasts(Gyne.Brain.MvP_BB=Gyne.Brain.Monogyne.No.BB-Gyne.Brain.Polygyne.No.BB, 
+                                   Gyne.Brain.pBBvpBL=Gyne.Brain.Polygyne.No.BB-Gyne.Brain.Polygyne.No.BL, 
+                                   Gyne.Brain.pBBvpLL=Gyne.Brain.Polygyne.No.BB-Gyne.Brain.Polygyne.No.LL, 
+                                   Gyne.Brain.mBBvpBL=Gyne.Brain.Monogyne.No.BB-Gyne.Brain.Polygyne.No.BL, 
+                                   levels=design_gyne_brain_pw)
+
+gyne.ovary.pw.contrasts <- makeContrasts(Gyne.Ovary.MvP_BB=Gyne.Ovary.Monogyne.No.BB-Gyne.Ovary.Polygyne.No.BB, 
+                                   Gyne.Ovary.pBBvpBL=Gyne.Ovary.Polygyne.No.BB-Gyne.Ovary.Polygyne.No.BL, 
+                                   Gyne.Ovary.pBBvpLL=Gyne.Ovary.Polygyne.No.BB-Gyne.Ovary.Polygyne.No.LL, 
+                                   Gyne.Ovary.mBBvpBL=Gyne.Ovary.Monogyne.No.BB-Gyne.Ovary.Polygyne.No.BL, 
+                                   levels=design_gyne_ovary_pw)
+
+## Social Form Comparisons
+Gyne.Brain.MvP_BB.qlf <- glmQLFTest(fit_gyne_brain_pw, contrast=gyne.brain.pw.contrasts[,"Gyne.Brain.MvP_BB"])
+Gyne.Brain.MvP_BB.qlf.TT <- topTags(Gyne.Brain.MvP_BB.qlf,p.value = 1,n=100000)
+
+Gyne.Ovary.MvP_BB.qlf <- glmQLFTest(fit_gyne_ovary_pw, contrast=gyne.ovary.pw.contrasts[,"Gyne.Ovary.MvP_BB"])
+Gyne.Ovary.MvP_BB.qlf.TT <- topTags(Gyne.Ovary.MvP_BB.qlf,p.value = 1,n=100000)
+
+## Supergene Comparisons
+Gyne.Brain.pBBvpBL.qlf <- glmQLFTest(fit_gyne_brain_pw, contrast=gyne.brain.pw.contrasts[,"Gyne.Brain.pBBvpBL"])
+Gyne.Brain.pBBvpBL.qlf.TT <- topTags(Gyne.Brain.pBBvpBL.qlf,p.value = 1,n=100000)
+
+Gyne.Ovary.pBBvpBL.qlf <- glmQLFTest(fit_gyne_ovary_pw, contrast=gyne.ovary.pw.contrasts[,"Gyne.Ovary.pBBvpBL"])
+Gyne.Ovary.pBBvpBL.qlf.TT <- topTags(Gyne.Ovary.pBBvpBL.qlf,p.value = 1,n=100000)
+
+Gyne.Brain.pBBvpLL.qlf <- glmQLFTest(fit_gyne_brain_pw, contrast=gyne.brain.pw.contrasts[,"Gyne.Brain.pBBvpLL"])
+Gyne.Brain.pBBvpLL.qlf.TT <- topTags(Gyne.Brain.pBBvpLL.qlf,p.value = 1,n=100000)
+
+Gyne.Ovary.pBBvpLL.qlf <- glmQLFTest(fit_gyne_ovary_pw, contrast=gyne.ovary.pw.contrasts[,"Gyne.Ovary.pBBvpLL"])
+Gyne.Ovary.pBBvpLL.qlf.TT <- topTags(Gyne.Ovary.pBBvpLL.qlf,p.value = 1,n=100000)
+
+Gyne.Brain.mBBvpBL.qlf <- glmQLFTest(fit_gyne_brain_pw, contrast=gyne.brain.pw.contrasts[,"Gyne.Brain.mBBvpBL"])
+Gyne.Brain.mBBvpBL.qlf.TT <- topTags(Gyne.Brain.mBBvpBL.qlf,p.value = 1,n=100000)
+
+Gyne.Ovary.mBBvpBL.qlf <- glmQLFTest(fit_gyne_ovary_pw, contrast=gyne.ovary.pw.contrasts[,"Gyne.Ovary.mBBvpBL"])
+Gyne.Ovary.mBBvpBL.qlf.TT <- topTags(Gyne.Ovary.mBBvpBL.qlf,p.value = 1,n=100000)
+
+## Load in Worker Data
+x_worker <- x1[,64:115]
+adv_group_worker <- adv_group[64:115,]
+
+x_worker_brain <- x_worker[,adv_group_worker$Tissue=="Brain"]
+x_worker_gaster <- x_worker[,adv_group_worker$Tissue=="Gaster"]
+adv_group_worker_brain <- adv_group_worker[adv_group_worker$Tissue=="Brain",]
+adv_group_worker_gaster <- adv_group_worker[adv_group_worker$Tissue=="Gaster",]
+
+
+y_worker_brain_pw <- DGEList(x_worker_brain,group = adv_group_worker_brain$pw_tag)
+y_worker_gaster_pw <- DGEList(x_worker_gaster,group = adv_group_worker_gaster$pw_tag)
+
+## Define the model matrix 
+design_worker_brain_pw <- model.matrix(~0+adv_group_worker_brain$pw_tag,data=y_worker_brain_pw$samples)
+colnames(design_worker_brain_pw) <- levels(y_worker_brain_pw$samples$group)
+
+design_worker_gaster_pw <- model.matrix(~0+adv_group_worker_gaster$pw_tag,data=y_worker_gaster_pw$samples)
+colnames(design_worker_gaster_pw) <- levels(y_worker_gaster_pw$samples$group)
+
+## Filter out low count genes
+y_worker_brain_pw <- y_worker_brain_pw[filterByExpr(y_worker_brain_pw, design_worker_brain_pw), , keep.lib.sizes=FALSE]
+y_worker_gaster_pw <- y_worker_gaster_pw[filterByExpr(y_worker_gaster_pw, design_worker_gaster_pw), , keep.lib.sizes=FALSE]
+
+## Normalize samples by library size
+y_worker_brain_pw <- calcNormFactors(y_worker_brain_pw)
+y_worker_gaster_pw <- calcNormFactors(y_worker_gaster_pw)
+
+## Begin Computing Differential Expression
+y_worker_brain_pw <- estimateDisp(y_worker_brain_pw,design_worker_brain_pw)
+y_worker_gaster_pw <- estimateDisp(y_worker_gaster_pw,design_worker_gaster_pw)
+
+## QLM Fit and DE analysis
+fit_worker_brain_pw <- glmQLFit(y_worker_brain_pw,design_worker_brain_pw)
+fit_worker_gaster_pw <- glmQLFit(y_worker_gaster_pw,design_worker_gaster_pw)
+
+worker.brain.pw.contrasts <- makeContrasts(Worker.Brain.MvP_BB=Worker.Brain.Monogyne.No.BB-Worker.Brain.Polygyne.No.BB,
+                                     Worker.Brain.MvCF_BB=Worker.Brain.Monogyne.No.BB-Worker.Brain.Monogyne.Yes.BB,
+                                     Worker.Brain.CFvP_BB=Worker.Brain.Monogyne.Yes.BB-Worker.Brain.Polygyne.No.BB,
+                                     Worker.Brain.pBBvpBL=Worker.Brain.Polygyne.No.BB-Worker.Brain.Polygyne.No.BL,
+                                     Worker.Brain.mBBvpBL=Worker.Brain.Monogyne.No.BB-Worker.Brain.Polygyne.No.BL,
+                              levels=design_worker_brain_pw)
+
+worker.gaster.pw.contrasts <- makeContrasts(Worker.Gaster.MvP_BB=Worker.Gaster.Monogyne.No.BB-Worker.Gaster.Polygyne.No.BB,
+                                     Worker.Gaster.MvCF_BB=Worker.Gaster.Monogyne.No.BB-Worker.Gaster.Monogyne.Yes.BB,
+                                     Worker.Gaster.CFvP_BB=Worker.Gaster.Monogyne.Yes.BB-Worker.Gaster.Polygyne.No.BB,
+                                     Worker.Gaster.pBBvpBL=Worker.Gaster.Polygyne.No.BB-Worker.Gaster.Polygyne.No.BL,
+                                     Worker.Gaster.mBBvpBL=Worker.Gaster.Monogyne.No.BB-Worker.Gaster.Polygyne.No.BL,
+                              levels=design_worker_gaster_pw)
+
+## Social Form Comparisons
+Worker.Brain.MvP_BB.qlf <- glmQLFTest(fit_worker_brain_pw, contrast=worker.brain.pw.contrasts[,"Worker.Brain.MvP_BB"])
+Worker.Brain.MvP_BB.qlf.TT <- topTags(Worker.Brain.MvP_BB.qlf,p.value = 1,n=100000)
+
+Worker.Gaster.MvP_BB.qlf <- glmQLFTest(fit_worker_gaster_pw, contrast=worker.gaster.pw.contrasts[,"Worker.Gaster.MvP_BB"])
+Worker.Gaster.MvP_BB.qlf.TT <- topTags(Worker.Gaster.MvP_BB.qlf,p.value = 1,n=100000)
+
+## Cross Foster Comparisons
+Worker.Brain.MvCF_BB.qlf <- glmQLFTest(fit_worker_brain_pw, contrast=worker.brain.pw.contrasts[,"Worker.Brain.MvCF_BB"])
+Worker.Brain.MvCF_BB.qlf.TT <- topTags(Worker.Brain.MvCF_BB.qlf,p.value = 1,n=100000)
+
+Worker.Gaster.MvCF_BB.qlf <- glmQLFTest(fit_worker_gaster_pw, contrast=worker.gaster.pw.contrasts[,"Worker.Gaster.MvCF_BB"])
+Worker.Gaster.MvCF_BB.qlf.TT <- topTags(Worker.Gaster.MvCF_BB.qlf,p.value = 1,n=100000)
+
+Worker.Brain.CFvP_BB.qlf <- glmQLFTest(fit_worker_brain_pw, contrast=worker.brain.pw.contrasts[,"Worker.Brain.CFvP_BB"])
+Worker.Brain.CFvP_BB.qlf.TT <- topTags(Worker.Brain.CFvP_BB.qlf,p.value = 1,n=100000)
+
+Worker.Gaster.CFvP_BB.qlf <- glmQLFTest(fit_worker_gaster_pw, contrast=worker.gaster.pw.contrasts[,"Worker.Gaster.CFvP_BB"])
+Worker.Gaster.CFvP_BB.qlf.TT <- topTags(Worker.Gaster.CFvP_BB.qlf,p.value = 1,n=100000)
+
+## Supergene Comparisons
+Worker.Brain.pBBvpBL.qlf <- glmQLFTest(fit_worker_brain_pw, contrast=worker.brain.pw.contrasts[,"Worker.Brain.pBBvpBL"])
+Worker.Brain.pBBvpBL.qlf.TT <- topTags(Worker.Brain.pBBvpBL.qlf,p.value = 1,n=100000)
+
+Worker.Gaster.pBBvpBL.qlf <- glmQLFTest(fit_worker_gaster_pw, contrast=worker.gaster.pw.contrasts[,"Worker.Gaster.pBBvpBL"])
+Worker.Gaster.pBBvpBL.qlf.TT <- topTags(Worker.Gaster.pBBvpBL.qlf,p.value = 1,n=100000)
+
+Worker.Brain.mBBvpBL.qlf <- glmQLFTest(fit_worker_brain_pw, contrast=worker.brain.pw.contrasts[,"Worker.Brain.mBBvpBL"])
+Worker.Brain.mBBvpBL.qlf.TT <- topTags(Worker.Brain.mBBvpBL.qlf,p.value = 1,n=100000)
+
+Worker.Gaster.mBBvpBL.qlf <- glmQLFTest(fit_worker_gaster_pw, contrast=worker.gaster.pw.contrasts[,"Worker.Gaster.mBBvpBL"])
+Worker.Gaster.mBBvpBL.qlf.TT <- topTags(Worker.Gaster.mBBvpBL.qlf,p.value = 1,n=100000)
+
+
+## Additivity Check
+gyne_brain_1 <- list(Gyne.Brain.MvP_BB=row.names(topTags(Gyne.Brain.MvP_BB.qlf,n = Inf,p.value = 0.1)),
+                       Gyne.Brain.pBBvpBL=row.names(topTags(Gyne.Brain.pBBvpBL.qlf,n = Inf,p.value = 0.1)),
+                       Gyne.Brain.mBBvpBL=row.names(topTags(Gyne.Brain.mBBvpBL.qlf,n = Inf,p.value = 0.1))                 )
+
+pdf(file = "~/Desktop/CasteRNA_analysis/Results_v6/gyne_brain_1.Upset_Additivity.pdf",width = 5,height = 5,onefile = F,useDingbats = F)
+gyne_brain_1.Upset <- upset(fromList(gyne_brain_1),nsets=3,order.by = "freq")
+gyne_brain_1.Upset
+dev.off()
+
+gyne_ovary_1 <- list(Gyne.Ovary.MvP_BB=row.names(topTags(Gyne.Ovary.MvP_BB.qlf,n = Inf,p.value = 0.1)),
+                       Gyne.Ovary.pBBvpBL=row.names(topTags(Gyne.Ovary.pBBvpBL.qlf,n = Inf,p.value = 0.1)),
+                       Gyne.Ovary.mBBvpBL=row.names(topTags(Gyne.Ovary.mBBvpBL.qlf,n = Inf,p.value = 0.1))                 )
+pdf(file = "~/Desktop/CasteRNA_analysis/Results_v6/gyne_ovary_1.Upset_Additivity.pdf",width = 5,height = 5,onefile = F,useDingbats = F)
+gyne_ovary_1.Upset <- upset(fromList(gyne_ovary_1),nsets=3,order.by = "freq")
+gyne_ovary_1.Upset
+dev.off()
+
+worker_brain_1 <- list(Worker.Brain.MvP_BB=row.names(topTags(Worker.Brain.MvP_BB.qlf,n = Inf,p.value = 0.1)),
+                       Worker.Brain.pBBvpBL=row.names(topTags(Worker.Brain.pBBvpBL.qlf,n = Inf,p.value = 0.1)),
+                       Worker.Brain.mBBvpBL=row.names(topTags(Worker.Brain.mBBvpBL.qlf,n = Inf,p.value = 0.1))                 )
+
+pdf(file = "~/Desktop/CasteRNA_analysis/Results_v6/worker_brain_1.Upset_Additivity.pdf",width = 5,height = 5,onefile = F,useDingbats = F)
+worker_brain_1.Upset <- upset(fromList(worker_brain_1),nsets=3,order.by = "freq")
+worker_brain_1.Upset
+dev.off()
+
+worker_gaster_1 <- list(Worker.Gaster.MvP_BB=row.names(topTags(Worker.Gaster.MvP_BB.qlf,n = Inf,p.value = 0.1)),
+                       Worker.Gaster.pBBvpBL=row.names(topTags(Worker.Gaster.pBBvpBL.qlf,n = Inf,p.value = 0.1)),
+                       Worker.Gaster.mBBvpBL=row.names(topTags(Worker.Gaster.mBBvpBL.qlf,n = Inf,p.value = 0.1))                 )
+
+pdf(file = "~/Desktop/CasteRNA_analysis/Results_v6/worker_gaster_1.Upset_Additivity.pdf",width = 5,height = 5,onefile = F,useDingbats = F)
+worker_gaster_1.Upset <- upset(fromList(worker_gaster_1),nsets=3,order.by = "freq")
+worker_gaster_1.Upset
+dev.off()
+
+## IDE and DE Venn Diagrams
+SF_1 <- list(Gyne.Brain.MvP_BB=row.names(topTags(Gyne.Brain.MvP_BB.qlf,n = Inf,p.value = 0.1)),
+                       Gyne.Ovary.MvP_BB=row.names(topTags(Gyne.Ovary.MvP_BB.qlf,n = Inf,p.value = 0.1)),
+                       Worker.Brain.MvP_BB=row.names(topTags(Worker.Brain.MvP_BB.qlf,n = Inf,p.value = 0.1)),
+                       Worker.Gaster.MvP_BB=row.names(topTags(Worker.Gaster.MvP_BB.qlf,n = Inf,p.value = 0.1))
+                 )
+
+pdf("~/Desktop/CasteRNA_analysis/Results_v6/IDE.Venn.1.pdf",height = 5,width=5,useDingbats = F,onefile = F)
+plot(venn(SF_1))
+dev.off()
+
+DirectEffect_set <- list(Gyne.Brain.pBBvpBL=row.names(topTags(Gyne.Brain.pBBvpBL.qlf,n = Inf,p.value = 0.1)),
+                      Gyne.Ovary.pBBvpBL=row.names(topTags(Gyne.Ovary.pBBvpBL.qlf,n = Inf,p.value = 0.1)),
+                      Worker.Brain.pBBvpBL=row.names(topTags(Worker.Brain.pBBvpBL.qlf,n = Inf,p.value = 0.1)),
+                      Worker.Gaster.pBBvpBL=row.names(topTags(Worker.Gaster.pBBvpBL.qlf,n = Inf,p.value = 0.1))
+                 )
+pdf("~/Desktop/CasteRNA_analysis/Results_v6/DE.Venn.1.pdf",height = 5,width=5,useDingbats = F,onefile = F)
+plot(venn(DirectEffect_set))
+dev.off()
+```
+
+## Figure 2 Generation V2
+```{R Figure_2}
+## Generate Effect Type Comparison Figure (Figure 2)
+get_DEG_nums <- function(qlftest,name){
+  output <- data.frame(Comparison=rep(name,3),
+                       Significance.Level=c(0.01,0.05,0.1),
+                       Number.of.DEGs=c(nrow(topTags(qlftest,n=Inf,p.value = 0.01)),
+                                        nrow(topTags(qlftest,n=Inf,p.value = 0.05))-nrow(topTags(qlftest,n=Inf,p.value = 0.01)),
+                                        nrow(topTags(qlftest,n=Inf,p.value = 0.1))-nrow(topTags(qlftest,n=Inf,p.value = 0.05))),
+                       Uncorrected=c(nrow(topTags(qlftest,n=Inf,p.value = 0.01)),
+                                        nrow(topTags(qlftest,n=Inf,p.value = 0.05)),
+                                        nrow(topTags(qlftest,n=Inf,p.value = 0.1)))
+                         )
+  return(output)
+}
+
+Effects_Table <- rbind(get_DEG_nums(Gyne.Brain.pBBvpBL.qlf,"Gyne.Brain.pBBvpBL"),
+                       get_DEG_nums(Gyne.Ovary.pBBvpBL.qlf,"Gyne.Ovary.pBBvpBL"),
+                       get_DEG_nums(Worker.Brain.pBBvpBL.qlf,"Worker.Brain.pBBvpBL"),
+                       get_DEG_nums(Worker.Gaster.pBBvpBL.qlf,"Worker.Gaster.pBBvpBL"),
+                       data.frame(Comparison="Spacer1",Significance.Level=0.1,Number.of.DEGs=10,Uncorrected=10),
+                       get_DEG_nums(Gyne.Brain.MvP_BB.qlf,"Gyne.Brain.MvP_BB"),
+                       get_DEG_nums(Gyne.Ovary.MvP_BB.qlf,"Gyne.Ovary.MvP_BB"),
+                       get_DEG_nums(Worker.Brain.MvP_BB.qlf,"Worker.Brain.MvP_BB"),
+                       get_DEG_nums(Worker.Gaster.MvP_BB.qlf,"Worker.Gaster.MvP_BB"),
+                       data.frame(Comparison="Spacer2",Significance.Level=0.1,Number.of.DEGs=10,Uncorrected=10),
+                       get_DEG_nums(Worker.Brain.MvCF_BB.qlf,"Worker.Brain.MvCF_BB"),
+                       get_DEG_nums(Worker.Gaster.MvCF_BB.qlf,"Worker.Gaster.MvCF_BB"),
+                       get_DEG_nums(Worker.Brain.CFvP_BB.qlf,"Worker.Brain.CFvP_BB"),
+                       get_DEG_nums(Worker.Gaster.CFvP_BB.qlf,"Worker.Gaster.CFvP_BB"),
+                       data.frame(Comparison="Spacer3",Significance.Level=0.1,Number.of.DEGs=10,Uncorrected=10),
+                       get_DEG_nums(Gyne.Brain.mBBvpBL.qlf,"Gyne.Brain.mBBvpBL"),
+                       get_DEG_nums(Gyne.Ovary.mBBvpBL.qlf,"Gyne.Ovary.mBBvpBL"),
+                       get_DEG_nums(Worker.Brain.mBBvpBL.qlf,"Worker.Brain.mBBvpBL"),
+                       get_DEG_nums(Worker.Gaster.mBBvpBL.qlf,"Worker.Gaster.mBBvpBL")    
+)
+Effects_Table$Significance.Level <- as.character(Effects_Table$Significance.Level)
+Effects_Table$Significance.Level <- factor(Effects_Table$Significance.Level, levels = c("0.1", "0.05", "0.01"))
+
+Num_DEGs_plot <- ggplot(aes(y = Uncorrected, x = Comparison, colour = Significance.Level), data = Effects_Table) + 
+  geom_point(size=3,shape=18) +
+  scale_y_log10() +
+  ylab("Number of DEGs") +
+  geom_hline(yintercept = 10) +
+  geom_hline(yintercept = 100) +
+  geom_hline(yintercept = 1000) +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(), 
+        axis.line = element_line(colour = "black"),
+        plot.title = element_text(hjust = 0.5),
+        axis.text.x=element_blank(),
+        axis.title.x = element_blank())
+
+## Generate LogFC box and whisker plot
+Indirect_Data <- data.frame(Comparison=character(),LogFC=double(),Significance=double())
+
+Indirect_Data <- rbind(Indirect_Data,data.frame(Comparison=rep("Gyne Brain pBBvpBL",nrow(Gyne.Brain.pBBvpBL.qlf.TT)),LogFC=Gyne.Brain.pBBvpBL.qlf.TT$table$logFC,Significance=Gyne.Brain.pBBvpBL.qlf.TT$table$FDR))
+Indirect_Data <- rbind(Indirect_Data,data.frame(Comparison=rep("Gyne Ovary pBBvpBL",nrow(Gyne.Ovary.pBBvpBL.qlf.TT)),LogFC=Gyne.Ovary.pBBvpBL.qlf.TT$table$logFC,Significance=Gyne.Ovary.pBBvpBL.qlf.TT$table$FDR))
+Indirect_Data <- rbind(Indirect_Data,data.frame(Comparison=rep("Worker Brain pBBvpBL",nrow(Worker.Brain.pBBvpBL.qlf.TT)),LogFC=Worker.Brain.pBBvpBL.qlf.TT$table$logFC,Significance=Worker.Brain.pBBvpBL.qlf.TT$table$FDR))
+Indirect_Data <- rbind(Indirect_Data,data.frame(Comparison=rep("Worker Gaster pBBvpBL",nrow(Worker.Gaster.pBBvpBL.qlf.TT)),LogFC=Worker.Gaster.pBBvpBL.qlf.TT$table$logFC,Significance=Worker.Gaster.pBBvpBL.qlf.TT$table$FDR))
+
+Indirect_Data <- rbind(Indirect_Data,data.frame(Comparison="Spacer1",LogFC=10,Significance=0.00001))
+
+Indirect_Data <- rbind(Indirect_Data,data.frame(Comparison=rep("Gyne Brain MvP BB",nrow(Gyne.Brain.MvP_BB.qlf.TT)),LogFC=Gyne.Brain.MvP_BB.qlf.TT$table$logFC,Significance=Gyne.Brain.MvP_BB.qlf.TT$table$FDR))
+Indirect_Data <- rbind(Indirect_Data,data.frame(Comparison=rep("Gyne Ovary MvP BB",nrow(Gyne.Ovary.MvP_BB.qlf.TT)),LogFC=Gyne.Ovary.MvP_BB.qlf.TT$table$logFC,Significance=Gyne.Ovary.MvP_BB.qlf.TT$table$FDR))
+Indirect_Data <- rbind(Indirect_Data,data.frame(Comparison=rep("Worker Brain MvP BB",nrow(Worker.Brain.MvP_BB.qlf.TT)),LogFC=Worker.Brain.MvP_BB.qlf.TT$table$logFC,Significance=Worker.Brain.MvP_BB.qlf.TT$table$FDR))
+Indirect_Data <- rbind(Indirect_Data,data.frame(Comparison=rep("Worker Gaster MvP BB",nrow(Worker.Gaster.MvP_BB.qlf.TT)),LogFC=Worker.Gaster.MvP_BB.qlf.TT$table$logFC,Significance=Worker.Gaster.MvP_BB.qlf.TT$table$FDR))
+
+Indirect_Data <- rbind(Indirect_Data,data.frame(Comparison="Spacer2",LogFC=10,Significance=0.00001))
+
+Indirect_Data <- rbind(Indirect_Data,data.frame(Comparison=rep("Worker Brain MvCF_BB",nrow(Worker.Brain.MvCF_BB.qlf.TT)),LogFC=Worker.Brain.MvCF_BB.qlf.TT$table$logFC,Significance=Worker.Brain.MvCF_BB.qlf.TT$table$FDR))
+Indirect_Data <- rbind(Indirect_Data,data.frame(Comparison=rep("Worker Gaster MvCF_BB",nrow(Worker.Gaster.MvCF_BB.qlf.TT)),LogFC=Worker.Gaster.MvCF_BB.qlf.TT$table$logFC,Significance=Worker.Gaster.MvCF_BB.qlf.TT$table$FDR))
+Indirect_Data <- rbind(Indirect_Data,data.frame(Comparison=rep("Worker Brain CFvP_BB",nrow(Worker.Brain.CFvP_BB.qlf.TT)),LogFC=Worker.Brain.CFvP_BB.qlf.TT$table$logFC,Significance=Worker.Brain.CFvP_BB.qlf.TT$table$FDR))
+Indirect_Data <- rbind(Indirect_Data,data.frame(Comparison=rep("Worker Gaster CFvP_BB",nrow(Worker.Gaster.CFvP_BB.qlf.TT)),LogFC=Worker.Gaster.CFvP_BB.qlf.TT$table$logFC,Significance=Worker.Gaster.CFvP_BB.qlf.TT$table$FDR))
+Indirect_Data <- rbind(Indirect_Data,data.frame(Comparison="Spacer3",LogFC=10,Significance=0.00001))
+
+Indirect_Data <- rbind(Indirect_Data,data.frame(Comparison=rep("Gyne Brain mBBvpBL",nrow(Gyne.Brain.mBBvpBL.qlf.TT)),LogFC=Gyne.Brain.mBBvpBL.qlf.TT$table$logFC,Significance=Gyne.Brain.mBBvpBL.qlf.TT$table$FDR))
+Indirect_Data <- rbind(Indirect_Data,data.frame(Comparison=rep("Gyne Ovary mBBvpBL",nrow(Gyne.Ovary.mBBvpBL.qlf.TT)),LogFC=Gyne.Ovary.mBBvpBL.qlf.TT$table$logFC,Significance=Gyne.Ovary.mBBvpBL.qlf.TT$table$FDR))
+Indirect_Data <- rbind(Indirect_Data,data.frame(Comparison=rep("Worker Brain mBBvpBL",nrow(Worker.Brain.mBBvpBL.qlf.TT)),LogFC=Worker.Brain.mBBvpBL.qlf.TT$table$logFC,Significance=Worker.Brain.mBBvpBL.qlf.TT$table$FDR))
+Indirect_Data <- rbind(Indirect_Data,data.frame(Comparison=rep("Worker Gaster mBBvpBL",nrow(Worker.Gaster.mBBvpBL.qlf.TT)),LogFC=Worker.Gaster.mBBvpBL.qlf.TT$table$logFC,Significance=Worker.Gaster.mBBvpBL.qlf.TT$table$FDR))
+
+
+sig_breaks <- c(1,2,5,10)
+# Box and Whisker Plot of all comparisons
+Indirect_Data_Sig <- Indirect_Data[Indirect_Data$Significance<=0.1,]
+Indirect_Data_Sig$NegLogSig <- -log10(Indirect_Data_Sig$Significance)
+Inidrect_Data_sort <- Indirect_Data_Sig[order(Indirect_Data_Sig$NegLogSig,decreasing = F),]
+logFC_plot <- ggplot(data = Indirect_Data, aes(x=Comparison, y=LogFC)) + 
+  geom_boxplot(outlier.shape = NA) + 
+  geom_jitter(shape=16, position=position_jitter(0.1),aes(x=Comparison, y=LogFC,colour=NegLogSig),data=Inidrect_Data_sort,alpha=0.5) + 
+  scale_colour_gradientn(colours = c("darkgoldenrod1","orange","red","red"),breaks=sig_breaks) +
+  geom_boxplot(outlier.shape = NA) + 
+  geom_hline(yintercept = 0,size=0.5) +
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(),
+        axis.line = element_line(colour = "black"),
+        plot.title = element_text(hjust = 0.5),
+        axis.text.x=element_blank(),
+        axis.title.x = element_blank())
+
+## logFC values for plot
+
+get_DE_values <- function(qlf){
+  sig1 <- topTags(qlf,n=Inf,p.value = 1)$table
+  a <- nrow(sig1[(sig1$logFC<0)&(sig1$FDR<=0.1),])
+  b <- nrow(sig1[(sig1$logFC>0)&(sig1$FDR<=0.1),])
+  c <- nrow(sig1[(sig1$logFC<0)&(sig1$FDR>0.1),])
+  d <- nrow(sig1[(sig1$logFC>0)&(sig1$FDR>0.1),])
+  print(c(a,b,c,d))
+  
+  chisq.test(x=matrix(c(a,b,c,d),nrow=2),correct = FALSE)$expected
+  chitest <- chisq.test(x=matrix(c(a,b,c,d),nrow=2),correct = FALSE) 
+  print(chitest)
+  fisher.test(x=matrix(c(a,b,c,d),nrow=2),alternative = "two.sided") 
+}
+# DE
+get_DE_values(Gyne.Brain.pBBvpBL.qlf)
+get_DE_values(Gyne.Ovary.pBBvpBL.qlf)
+get_DE_values(Worker.Brain.pBBvpBL.qlf)
+get_DE_values(Worker.Gaster.pBBvpBL.qlf)
+#get_DE_values(Male.WholeBody.BvL.qlf)
+
+## IDE
+get_DE_values(Gyne.Brain.MvP_BB.qlf)
+get_DE_values(Gyne.Ovary.MvP_BB.qlf)
+get_DE_values(Worker.Brain.MvP_BB.qlf)
+get_DE_values(Worker.Gaster.MvP_BB.qlf)
+
+## Combinatory
+get_DE_values(Gyne.Brain.mBBvpBL.qlf)
+get_DE_values(Gyne.Ovary.mBBvpBL.qlf)
+get_DE_values(Worker.Brain.mBBvpBL.qlf)
+get_DE_values(Worker.Gaster.mBBvpBL.qlf)
+
+
+# pdf("~/Desktop/CasteRNA_analysis/Results_v4/DvI_LogFC_box_split.pdf",height=5,width=6,useDingbats = F)
+# p
+# dev.off()
+
+## Generate Plot of Observed/Expected Number of DEGs in Supergene (by significance) for all comparisons
+get_supergene_ratio <- function(et,name){
+  Sinv_annot_lg <- read_delim("~/Desktop/CasteRNA_analysis/SINVBB1_gene.bed","\t", escape_double = FALSE, col_names = FALSE, trim_ws = TRUE)
+  temp <- topTags(et, n=Inf)$table
+  temp$gene <- row.names(temp)
+  temp_merge <- merge(temp,Sinv_annot_lg,by.x="gene",by.y="X4",all.x=TRUE)
+  volcanoData <- data.frame(temp_merge)
+  volcanoData$Sig <- volcanoData$FDR <= 0.01
+  volcanoData$negLogPval <- -1*log10(volcanoData$FDR)
+  volcanoData$Location <- 0
+  
+  for (i in 1:nrow(volcanoData)) {
+    if (!grepl("chr",volcanoData$X1[i])) {
+      volcanoData$Location[i] <- "Unmapped"
+    } else {
+      if (grepl("chr16",volcanoData$X1[i])&&(volcanoData$X2[i]>=12612565)&&(volcanoData$X3[i]<=24031576)) {
+        volcanoData$Location[i] <- "Supergene"
+      } else {
+        volcanoData$Location[i] <- "Non-Supergene"
+      }
+    }
+  }
+  
+  # P <= 0.01
+  a_01 <- nrow(volcanoData[(volcanoData$FDR<=0.01)&(volcanoData$Location == "Supergene"),])
+  b_01 <- nrow(volcanoData[(volcanoData$FDR<=0.01)&(volcanoData$Location == "Non-Supergene"),])
+  c_01 <- nrow(volcanoData[(volcanoData$FDR>0.01)&(volcanoData$Location == "Supergene"),])
+  d_01 <- nrow(volcanoData[(volcanoData$FDR>0.01)&(volcanoData$Location == "Non-Supergene"),])  
+  P_01 <- chisq.test(x=matrix(c(a_01,b_01,c_01,d_01),nrow=2),correct = FALSE)$p.value
+  rat_01 <- chisq.test(x=matrix(c(a_01,b_01,c_01,d_01),nrow=2),correct = FALSE)$ob[1,1]/chisq.test(x=matrix(c(a_01,b_01,c_01,d_01),nrow=2),correct = FALSE)$ex[1,1]
+  
+  # P <= 0.05
+  a_05 <- nrow(volcanoData[(volcanoData$FDR<=0.05)&(volcanoData$Location == "Supergene"),])
+  b_05 <- nrow(volcanoData[(volcanoData$FDR<=0.05)&(volcanoData$Location == "Non-Supergene"),])
+  c_05 <- nrow(volcanoData[(volcanoData$FDR>0.05)&(volcanoData$Location == "Supergene"),])
+  d_05 <- nrow(volcanoData[(volcanoData$FDR>0.05)&(volcanoData$Location == "Non-Supergene"),])
+  P_05 <- chisq.test(x=matrix(c(a_05,b_05,c_05,d_05),nrow=2),correct = FALSE)$p.value
+  rat_05 <- chisq.test(x=matrix(c(a_05,b_05,c_05,d_05),nrow=2),correct = FALSE)$ob[1,1]/chisq.test(x=matrix(c(a_05,b_05,c_05,d_05),nrow=2),correct = FALSE)$ex[1,1]
+  
+  # P <= 0.1
+  a_1 <- nrow(volcanoData[(volcanoData$FDR<=0.1)&(volcanoData$Location == "Supergene"),])
+  b_1 <- nrow(volcanoData[(volcanoData$FDR<=0.1)&(volcanoData$Location == "Non-Supergene"),])
+  c_1 <- nrow(volcanoData[(volcanoData$FDR>0.1)&(volcanoData$Location == "Supergene"),])
+  d_1 <- nrow(volcanoData[(volcanoData$FDR>0.1)&(volcanoData$Location == "Non-Supergene"),])
+  P_1 <- chisq.test(x=matrix(c(a_1,b_1,c_1,d_1),nrow=2),correct = FALSE)$p.value
+  rat_1 <- chisq.test(x=matrix(c(a_1,b_1,c_1,d_1),nrow=2),correct = FALSE)$ob[1,1]/chisq.test(x=matrix(c(a_1,b_1,c_1,d_1),nrow=2),correct = FALSE)$ex[1,1]
+  
+  output <- data.frame(Comparison=rep(name,3),
+                       Significance.Level=c(0.01,0.05,0.1),
+                       Supergene.DEGs=c(a_01,a_05,a_1),
+                       Supergene.Ratio=c(rat_01,rat_05,rat_1),
+                       Supergene.P=c(P_01,P_05,P_1)
+  )
+  return(output)
+}
+
+
+
+supergene_Table <- rbind(get_supergene_ratio(Gyne.Brain.pBBvpBL.qlf,"Gyne.Brain.pBBvpBL"),
+                       get_supergene_ratio(Gyne.Ovary.pBBvpBL.qlf,"Gyne.Ovary.pBBvpBL"),
+                       get_supergene_ratio(Worker.Brain.pBBvpBL.qlf,"Worker.Brain.pBBvpBL"),
+                       get_supergene_ratio(Worker.Gaster.pBBvpBL.qlf,"Worker.Gaster.pBBvpBL"),
+                       data.frame(Comparison="Spacer1",Significance.Level=0.1,Supergene.DEGs=10,Supergene.Ratio=0.2,Supergene.P=0.01),
+                       get_supergene_ratio(Gyne.Brain.MvP_BB.qlf,"Gyne.Brain.MvP_BB"),
+                       get_supergene_ratio(Gyne.Ovary.MvP_BB.qlf,"Gyne.Ovary.MvP_BB"),
+                       get_supergene_ratio(Worker.Brain.MvP_BB.qlf,"Worker.Brain.MvP_BB"),
+                       get_supergene_ratio(Worker.Gaster.MvP_BB.qlf,"Worker.Gaster.MvP_BB"),
+                       data.frame(Comparison="Spacer2",Significance.Level=0.1,Supergene.DEGs=10,Supergene.Ratio=0.2,Supergene.P=0.01),
+                       get_supergene_ratio(Worker.Brain.MvCF_BB.qlf,"Worker.Brain.MvCF_BB"),
+                       get_supergene_ratio(Worker.Gaster.MvCF_BB.qlf,"Worker.Gaster.MvCF_BB"),
+                       get_supergene_ratio(Worker.Brain.CFvP_BB.qlf,"Worker.Brain.CFvP_BB"),
+                       get_supergene_ratio(Worker.Gaster.CFvP_BB.qlf,"Worker.Gaster.CFvP_BB"),
+                       data.frame(Comparison="Spacer3",Significance.Level=0.1,Supergene.DEGs=10,Supergene.Ratio=0.2,Supergene.P=0.01),
+                       get_supergene_ratio(Gyne.Brain.mBBvpBL.qlf,"Gyne.Brain.mBBvpBL"),
+                       get_supergene_ratio(Gyne.Ovary.mBBvpBL.qlf,"Gyne.Ovary.mBBvpBL"),
+                       get_supergene_ratio(Worker.Brain.mBBvpBL.qlf,"Worker.Brain.mBBvpBL"),
+                       get_supergene_ratio(Worker.Gaster.mBBvpBL.qlf,"Worker.Gaster.mBBvpBL")
+)
+supergene_Table$Significance.Level <- as.character(supergene_Table$Significance.Level)
+supergene_Table$Significance.Level <- factor(supergene_Table$Significance.Level, levels = c("0.1", "0.05", "0.01"))
+#supergene_Table$Group <- c(rep("Direct Effect",12),rep("Indirect Effect",12),rep("Pre-Pupation Indirect Effect",12),rep("Direct and Indirect Effect",12))
+supergene_Table$logRatio <- log2(supergene_Table$Supergene.Ratio)
+
+supergene_Table_01 <- supergene_Table[supergene_Table$Significance.Level=="0.1",]
+Supergene_Ratio_01_plot <- ggplot(aes(y = logRatio, x = Comparison,fill = logRatio > 0), data = supergene_Table_01) + 
+  geom_bar(stat="identity",width = 0.7) +
+  ylab("Observed/Expected Ratio of DEGs within the Supergene") + 
+  geom_hline(yintercept = 0) + 
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(), 
+        axis.line = element_line(colour = "black"),
+        plot.title = element_text(hjust = 0.5),
+        axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+Supergene_Ratio_plot <- ggplot(aes(y = Supergene.Ratio, x = Comparison, colour = Significance.Level), data = supergene_Table) + 
+  geom_point(size=3,shape=18) +
+  scale_y_log10() +
+  ylab("Observed/Expected Ratio of DEGs within the Supergene") + 
+  theme(panel.grid.major = element_blank(), 
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank(), 
+        axis.line = element_line(colour = "black"),
+        plot.title = element_text(hjust = 0.5),
+        axis.text.x=element_blank(),
+        axis.title.x = element_blank())
+
+grid.arrange(Supergene_Ratio_01_plot, logFC_plot,Num_DEGs_plot, ncol = 1, heights = c(1,1,2))
+
+pdf(file = "~/Desktop/CasteRNA_analysis/Results_v6/Figure2_v5_left.pdf",width = 5,height = 6,onefile = TRUE,useDingbats = F)
+plot_grid(Num_DEGs_plot,
+          logFC_plot,
+          Supergene_Ratio_01_plot,
+          ncol=1,align='v',rel_heights = c(0.8,0.8,1.5))
+dev.off()
+
+```
+
+## GLM Analysis
+```{R GLM}
+
+x_glm <- x1 
+adv_group_glm <- adv_group
+
+x_glm <- x_glm[,(adv_group_glm$Adopted=="No")&(adv_group_glm$Genotype %in% c("BB","BL"))&(adv_group_glm$Caste %in% c("Gyne","Worker"))]
+adv_group_glm <- adv_group_glm[(adv_group_glm$Adopted=="No")&(adv_group_glm$Genotype %in% c("BB","BL"))&(adv_group_glm$Caste %in% c("Gyne","Worker")),]
+## Remove Cross fosters, males, and bb since they are not relevant to the comparisons
+
+adv_group_glm$Tissue <- factor(adv_group_glm$Tissue)
+adv_group_glm$Origin_Colony <- factor(adv_group_glm$Origin_Colony)
+adv_group_glm$Adopted <- factor(adv_group_glm$Adopted)
+adv_group_glm$Caste <- factor(adv_group_glm$Caste)
+Genotype_temp <- factor(adv_group_glm$Genotype)
+adv_group_glm$Genotype2 <- relevel(Genotype_temp,ref="BB")
+rm(Genotype_temp)
+
+## Describe the Experiment Design and define Contrasts
+GLM_design <- model.matrix(~0+Caste+Tissue+Origin_Colony+Genotype2,data=adv_group_glm)
+
+colnames(GLM_design) <- c("Gyne","Worker","Gaster","Ovary","SocialForm","GenotypeBb")
+
+y_glm <- DGEList(x_glm,samples = GLM_design)
+
+y_glm <- y_glm[filterByExpr(y_glm, GLM_design), , keep.lib.sizes=FALSE]
+y_glm <- calcNormFactors(y_glm)
+
+## Begin Computing Differential Expression
+y_glm <- estimateDisp(y_glm,GLM_design)
+
+## QLM Fit and DE analysis
+## Note: For more conservative estimates, use glmQLFTest vs. glmLRT
+fit_glm <- glmQLFit(y_glm,GLM_design)
+
+## Compute Differential expression based on number of supergene alleles
+glm.DE <- glmQLFTest(fit_glm,coef="GenotypeBb") 
+glm.DE_TT <- topTags(glm.DE,n=Inf)
+
+glm.IDE <- glmQLFTest(fit_glm,coef="SocialForm") 
+glm.IDE_TT <- topTags(glm.IDE,n=Inf)
+
+make_volcano_fancy_highFDR <- function(et,Title) {
+  Sinv_annot_lg <- read_delim("~/Desktop/CasteRNA_analysis/SINVBB1_gene.bed","\t", escape_double = FALSE, col_names = FALSE, trim_ws = TRUE)
+  temp <- topTags(et, n=Inf)$table
+  temp$gene <- row.names(temp)
+  temp_merge <- merge(temp,Sinv_annot_lg,by.x="gene",by.y="X4",all.x=TRUE)
+  volcanoData <- data.frame(temp_merge)
+  volcanoData$Sig <- volcanoData$FDR <= 0.01
+  volcanoData$negLogPval <- -1*log10(volcanoData$FDR)
+  volcanoData$Location <- 0
+  
+  for (i in 1:nrow(volcanoData)) {
+    if (!grepl("chr",volcanoData$X1[i])) {
+      volcanoData$Location[i] <- "Unmapped"
+    } else {
+      if (grepl("chr16",volcanoData$X1[i])&&(volcanoData$X2[i]>=12612565)&&(volcanoData$X3[i]<=24031576)) {
+        volcanoData$Location[i] <- "Supergene"
+      } else {
+        volcanoData$Location[i] <- "Non-Supergene"
+      }
+    }
+  }
+
+   print(paste("Genes FDR <= 0.01, LogFC 0 : ",nrow(volcanoData[(volcanoData$FDR<=0.01)&(volcanoData$logFC > 0),])))
+   print(paste("Genes FDR <= 0.01, LogFC < 0 : ",nrow(volcanoData[(volcanoData$FDR<=0.01)&(volcanoData$logFC < 0),])))
+   print(paste("Genes FDR <= 0.05, LogFC 0 : ",nrow(volcanoData[(volcanoData$FDR<=0.05)&(volcanoData$logFC > 0),])))
+   print(paste("Genes FDR <= 0.05, LogFC < 0 : ",nrow(volcanoData[(volcanoData$FDR<=0.05)&(volcanoData$logFC < 0),])))
+   print(paste("Genes FDR <= 0.1, LogFC 0 : ",nrow(volcanoData[(volcanoData$FDR<=0.1)&(volcanoData$logFC > 0),])))
+   print(paste("Genes FDR <= 0.1, LogFC < 0 : ",nrow(volcanoData[(volcanoData$FDR<=0.1)&(volcanoData$logFC < 0),])))
+
+  
+  x_bounds = round(max(abs(volcanoData$logFC)))
+  y_bound = max(c(round(volcanoData$negLogPval),3))
+  volcPlot <- ggplot(volcanoData,aes(x=logFC,y=negLogPval)) +
+    geom_point(aes(color=Location,shape=Location),alpha=0.33, size=3.5) +
+    labs(x = "log2-Fold Change", y = "-log10(P-value)",title=Title) +
+    theme(legend.position="right", axis.title.x = element_text(face="bold", size=18), axis.text.x  = element_text(size=18), axis.title.y = element_text(face="bold", size=18), axis.text.y  = element_text(size=18),plot.title = element_text(face="bold", size=20)) +
+    scale_x_continuous(limits=c((-1)*x_bounds,x_bounds),breaks=c((-1)*x_bounds,-3,0,3,x_bounds)) +
+    scale_y_continuous(limits=c(0,y_bound)) +
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),panel.background = element_blank(), axis.line = element_line(colour = "black"),plot.title = element_text(hjust = 0.5))
+  return(volcPlot)
+}
+
+make_volcano_fancy_lowFDR <- function(et,Title) {
+  Sinv_annot_lg <- read_delim("~/Desktop/CasteRNA_analysis/SINVBB1_gene.bed","\t", escape_double = FALSE, col_names = FALSE, trim_ws = TRUE)
+  temp <- topTags(et, n=Inf)$table
+  temp$gene <- row.names(temp)
+  temp_merge <- merge(temp,Sinv_annot_lg,by.x="gene",by.y="X4",all.x=TRUE)
+  volcanoData <- data.frame(temp_merge)
+  volcanoData$Sig <- volcanoData$FDR <= 0.01
+  volcanoData$negLogPval <- -1*log10(volcanoData$FDR)
+  volcanoData$Location <- 0
+  
+  for (i in 1:nrow(volcanoData)) {
+    if (!grepl("chr",volcanoData$X1[i])) {
+      volcanoData$Location[i] <- "Unmapped"
+    } else {
+      if (grepl("chr16",volcanoData$X1[i])&&(volcanoData$X2[i]>=12612565)&&(volcanoData$X3[i]<=24031576)) {
+        volcanoData$Location[i] <- "Supergene"
+      } else {
+        volcanoData$Location[i] <- "Non-Supergene"
+      }
+    }
+  }
+
+   print(paste("Genes FDR <= 0.01, LogFC 0 : ",nrow(volcanoData[(volcanoData$FDR<=0.01)&(volcanoData$logFC > 0),])))
+   print(paste("Genes FDR <= 0.01, LogFC < 0 : ",nrow(volcanoData[(volcanoData$FDR<=0.01)&(volcanoData$logFC < 0),])))
+   print(paste("Genes FDR <= 0.05, LogFC 0 : ",nrow(volcanoData[(volcanoData$FDR<=0.05)&(volcanoData$logFC > 0),])))
+   print(paste("Genes FDR <= 0.05, LogFC < 0 : ",nrow(volcanoData[(volcanoData$FDR<=0.05)&(volcanoData$logFC < 0),])))
+   print(paste("Genes FDR <= 0.1, LogFC 0 : ",nrow(volcanoData[(volcanoData$FDR<=0.1)&(volcanoData$logFC > 0),])))
+   print(paste("Genes FDR <= 0.1, LogFC < 0 : ",nrow(volcanoData[(volcanoData$FDR<=0.1)&(volcanoData$logFC < 0),])))
+
+  
+  x_bounds = round(max(abs(volcanoData$logFC)))
+  y_bound = max(c(round(volcanoData$negLogPval),3))
+  volcPlot <- ggplot(volcanoData,aes(x=logFC,y=negLogPval)) +
+    geom_point(aes(color=Location,shape=Location),alpha=0.33, size=3.5) +
+    labs(x = "log2-Fold Change", y = "-log10(P-value)",title=Title) +
+    theme(legend.position="right", axis.title.x = element_text(face="bold", size=18), axis.text.x  = element_text(size=18), axis.title.y = element_text(face="bold", size=18), axis.text.y  = element_text(size=18),plot.title = element_text(face="bold", size=20)) +
+    scale_x_continuous(limits=c((-1)*x_bounds,x_bounds),breaks=c((-1)*x_bounds,-3,0,3,x_bounds)) +
+    scale_y_continuous(limits=c(0,3.5)) +
+    theme(panel.grid.major = element_blank(), panel.grid.minor = element_blank(),panel.background = element_blank(), axis.line = element_line(colour = "black"),plot.title = element_text(hjust = 0.5))
+  return(volcPlot)
+}
+
+make_volcano_fancy_highFDR(glm.DE,"Direct Effect GLM")
+make_volcano_fancy_lowFDR(glm.DE,"Direct Effect GLM")
+make_volcano_fancy_lowFDR(glm.IDE,"Indirect Effect GLM")
+
+
+pdf("~/Desktop/CasteRNA_analysis/Results_v6/GLM_DE_Volcano_high.pdf",height = 5,width=7,useDingbats = F,onefile = F)
+make_volcano_fancy_highFDR(glm.DE,"Direct Effect GLM")
+dev.off()
+
+pdf("~/Desktop/CasteRNA_analysis/Results_v6/GLM_DE_Volcano_low.pdf",height = 5,width=7,useDingbats = F,onefile = F)
+make_volcano_fancy_lowFDR(glm.DE,"Direct Effect GLM")
+dev.off()
+
+pdf("~/Desktop/CasteRNA_analysis/Results_v6/GLM_IDE_Volcano_low.pdf",height = 5,width=7,useDingbats = F,onefile = F)
+make_volcano_fancy_lowFDR(glm.IDE,"Indirect Effect GLM")
+dev.off()
+
+```
+## Candidate Gene Analysis/QC Checking
+```{R Candid_QC}
+## Map significant DE's to names for Candidate gene tables
+
+merge_sig_genes <- function(sig_genes){
+  int_temp <- sig_genes
+  int_temp$gene <- row.names(sig_genes)
+  temp_merge <- merge(int_temp,Sinv_annot,by.x="gene",by.y="gene",all.x=TRUE)
+  return(data.frame(temp_merge))
+}
+
+## PW
+Gyne.Brain.pBBvpBL.qlf.TT.sig.merge <- merge_sig_genes(topTags(Gyne.Brain.pBBvpBL.qlf,n = Inf,p.value = 0.1)$table)
+Gyne.Ovary.pBBvpBL.qlf.TT.sig.merge <- merge_sig_genes(topTags(Gyne.Ovary.pBBvpBL.qlf,n = Inf,p.value = 0.1)$table)
+Worker.Brain.pBBvpBL.qlf.TT.sig.merge <- merge_sig_genes(topTags(Worker.Brain.pBBvpBL.qlf,n = Inf,p.value = 0.1)$table)
+Worker.Gaster.pBBvpBL.qlf.TT.sig.merge <- merge_sig_genes(topTags(Worker.Gaster.pBBvpBL.qlf,n = Inf,p.value = 0.1)$table)
+
+Gyne.Brain.MvP_BB.qlf.TT.sig.merge <- merge_sig_genes(topTags(Gyne.Brain.MvP_BB.qlf,n = Inf,p.value = 0.1)$table)
+Gyne.Ovary.MvP_BB.qlf.TT.sig.merge <- merge_sig_genes(topTags(Gyne.Ovary.MvP_BB.qlf,n = Inf,p.value = 0.1)$table)
+#Worker.Brain.MvP_BB.qlf.TT.sig.merge <- merge_sig_genes(topTags(Worker.Brain.MvP_BB.qlf,n = Inf,p.value = 0.1)$table) ## No DEGs
+Worker.Gaster.MvP_BB.qlf.TT.sig.merge <- merge_sig_genes(topTags(Worker.Gaster.MvP_BB.qlf,n = Inf,p.value = 0.1)$table)
+
+Gyne.Brain.mBBvpBL.qlf.TT.sig.merge <- merge_sig_genes(topTags(Gyne.Brain.mBBvpBL.qlf,n = Inf,p.value = 0.1)$table)
+Gyne.Ovary.mBBvpBL.qlf.TT.sig.merge <- merge_sig_genes(topTags(Gyne.Ovary.mBBvpBL.qlf,n = Inf,p.value = 0.1)$table)
+Worker.Brain.mBBvpBL.qlf.TT.sig.merge <- merge_sig_genes(topTags(Worker.Brain.mBBvpBL.qlf,n = Inf,p.value = 0.1)$table)
+Worker.Gaster.mBBvpBL.qlf.TT.sig.merge <- merge_sig_genes(topTags(Worker.Gaster.mBBvpBL.qlf,n = Inf,p.value = 0.1)$table)
+
+## GLM
+glm.DE.sig.merge <- merge_sig_genes(topTags(glm.DE_TT,n = Inf,p.value = 0.1)$table)
+glm.IDE.sig.merge <- merge_sig_genes(topTags(glm.IDE_TT,n = Inf,p.value = 0.1)$table)
+
+
+
+## GO term enrichment for the P < 0.1 for all comparisons
+generate_GO_table_toExcel <- function(data,filename) {
+  QLF_TT_all <- topTags(data,p.value = 1,n=Inf)$table
+  QLF_TT_sig <- topTags(data,p.value = 0.1,n=Inf)$table
+  
+  ## Load in custom annotation
+  sinv_GO <- readMappings("~/Desktop/CasteRNA_analysis/Sinv_eggnog_GO.annot.map", sep = "\t", IDsep=",")
+  
+  ## Load Specific Gene List 
+  myInterestingGenes <- row.names(QLF_TT_sig)
+  
+  ## Load Full Gene Set
+  geneNames <- row.names(QLF_TT_all)
+  
+  ## Create geneList Structure 
+  geneList <- factor(as.integer(geneNames %in% myInterestingGenes))
+  names(geneList) <- geneNames
+  
+  ### Run for BP
+  
+  ## Laod the data into a topGO data object (BP,MF,CC)
+  GOData <- new("topGOdata",ontology="BP",allGenes=geneList,description="GO analysis of DEGs with q<0.01", annot = annFUN.gene2GO, gene2GO = sinv_GO)
+  
+  ## Compute GO term enrichment
+  resultClassic <- runTest(GOData, algorithm="classic", statistic="fisher")
+  resultElim <- runTest(GOData, algorithm="elim", statistic="fisher")
+  resultTopgo <- runTest(GOData, algorithm="weight01", statistic="fisher")
+  
+  allGO = usedGO(object = GOData) 
+  
+  allRes <- GenTable(GOData, classicFisher = resultClassic, elimFisher = resultElim, topgoFisher = resultTopgo, orderBy = "topgoFisher", ranksOf = "topgoFisher", topNodes = length(allGO))
+  
+  aa <- sapply(unname(sapply(allRes$GO.ID, function(x) {genes<-genesInTerm(GOData, x); genes[[1]][sapply(genes[[1]],function(id) id %in% myInterestingGenes)]})),paste0,collapse=",")
+  allRes$genes <- aa
+  
+  allRes$topgoFisher <- as.numeric(allRes$topgoFisher)
+  res_print_BP <- allRes[order(allRes$topgoFisher),c(1:5,8,9)]
+  # write.xlsx(res_print_BP,file=filename,sheetName="Biological Processes",append=TRUE)
+  
+  
+  GOData <- new("topGOdata",ontology="MF",allGenes=geneList,description="GO analysis of DEGs with q<0.01", annot = annFUN.gene2GO, gene2GO = sinv_GO)
+  
+  ## Compute GO term enrichment
+  resultClassic <- runTest(GOData, algorithm="classic", statistic="fisher")
+  resultElim <- runTest(GOData, algorithm="elim", statistic="fisher")
+  resultTopgo <- runTest(GOData, algorithm="weight01", statistic="fisher")
+  
+  allGO = usedGO(object = GOData) 
+  
+  allRes <- GenTable(GOData, classicFisher = resultClassic, elimFisher = resultElim, topgoFisher = resultTopgo, orderBy = "topgoFisher", ranksOf = "topgoFisher", topNodes = length(allGO))
+  
+  aa <- sapply(unname(sapply(allRes$GO.ID, function(x) {genes<-genesInTerm(GOData, x); genes[[1]][sapply(genes[[1]],function(id) id %in% myInterestingGenes)]})),paste0,collapse=",")
+  allRes$genes <- aa
+  
+  allRes$topgoFisher <- as.numeric(allRes$topgoFisher)
+  res_print_MF <- allRes[order(allRes$topgoFisher),c(1:5,8,9)]
+  # write.xlsx(res_print_MF,file=filename,sheetName="Molecular Function",append=TRUE)
+  
+  GOData <- new("topGOdata",ontology="CC",allGenes=geneList,description="GO analysis of DEGs with q<0.01", annot = annFUN.gene2GO, gene2GO = sinv_GO)
+  
+  ## Compute GO term enrichment
+  resultClassic <- runTest(GOData, algorithm="classic", statistic="fisher")
+  resultElim <- runTest(GOData, algorithm="elim", statistic="fisher")
+  resultTopgo <- runTest(GOData, algorithm="weight01", statistic="fisher")
+  
+  allGO = usedGO(object = GOData) 
+  
+  allRes <- GenTable(GOData, classicFisher = resultClassic, elimFisher = resultElim, topgoFisher = resultTopgo, orderBy = "topgoFisher", ranksOf = "topgoFisher", topNodes = length(allGO))
+  
+  aa <- sapply(unname(sapply(allRes$GO.ID, function(x) {genes<-genesInTerm(GOData, x); genes[[1]][sapply(genes[[1]],function(id) id %in% myInterestingGenes)]})),paste0,collapse=",")
+  allRes$genes <- aa
+  
+  allRes$topgoFisher <- as.numeric(allRes$topgoFisher)
+  res_print_CC <- allRes[order(allRes$topgoFisher),c(1:5,8,9)]
+  # write.xlsx(res_print_CC,file=filename,sheetName="Cellular Component",append=TRUE)
+  
+  GO_list <- list("Biological Processes"=res_print_BP,"Molecular Function"=res_print_MF,"Cellular Component"=res_print_CC)
+  write.xlsx(GO_list,file=filename)
+  return(allRes)
+}
+
+Gyne.Brain.pBBvpBL.qlf.GO <- generate_GO_table_toExcel(Gyne.Brain.pBBvpBL.qlf,"Gyne.Brain.pBBvpBL.xlsx")
+Gyne.Ovary.pBBvpBL.qlf.GO <- generate_GO_table_toExcel(Gyne.Ovary.pBBvpBL.qlf,"Gyne.Ovary.pBBvpBL.xlsx")
+Worker.Brain.pBBvpBL.qlf.GO <- generate_GO_table_toExcel(Worker.Brain.pBBvpBL.qlf,"Worker.Brain.pBBvpBL.xlsx")
+Worker.Gaster.pBBvpBL.qlf.GO <- generate_GO_table_toExcel(Worker.Gaster.pBBvpBL.qlf,"Worker.Gaster.pBBvpBL.xlsx")
+
+Gyne.Brain.MvP_BB.qlf.GO <- generate_GO_table_toExcel(Gyne.Brain.MvP_BB.qlf,"Gyne.Brain.MvP_BB.xlsx")
+Gyne.Ovary.MvP_BB.qlf.GO <- generate_GO_table_toExcel(Gyne.Ovary.MvP_BB.qlf,"Gyne.Ovary.MvP_BB.xlsx")
+#Worker.Brain.MvP_BB.qlf.GO <- generate_GO_table_toExcel(Worker.Brain.MvP_BB.qlf,"Worker.Brain.MvP_BB.xlsx")
+Worker.Gaster.MvP_BB.qlf.GO <- generate_GO_table_toExcel(Worker.Gaster.MvP_BB.qlf,"Worker.Gaster.MvP_BB.xlsx")
+
+Gyne.Brain.mBBvpBL.qlf.GO <- generate_GO_table_toExcel(Gyne.Brain.mBBvpBL.qlf,"Gyne.Brain.mBBvpBL.xlsx")
+Gyne.Ovary.mBBvpBL.qlf.GO <- generate_GO_table_toExcel(Gyne.Ovary.mBBvpBL.qlf,"Gyne.Ovary.mBBvpBL.xlsx")
+Worker.Brain.mBBvpBL.qlf.GO <- generate_GO_table_toExcel(Worker.Brain.mBBvpBL.qlf,"Worker.Brain.mBBvpBL.xlsx")
+Worker.Gaster.mBBvpBL.qlf.GO <- generate_GO_table_toExcel(Worker.Gaster.mBBvpBL.qlf,"Worker.Gaster.mBBvpBL.xlsx")
+
+glm.DE.qlf.GO <- generate_GO_table_toExcel(glm.DE,"glm.DE.xlsx")
+glm.IDE.qlf.GO <- generate_GO_table_toExcel(glm.IDE,"glm.IDE.xlsx")
+
+## Make a compendium Data Sheet for the Differential Expression analysis
+
+## Direct Effect
+Gyne_Brain_Bb <- Gyne.Brain.pBBvpBL.qlf.TT$table[,c(1,2,5)]
+colnames(Gyne_Brain_Bb) <- c("Gyne_Brain_Bb_logFC","Gyne_Brain_Bb_logCPM","Gyne_Brain_Bb_FDR")
+temp <- merge(Sinv_annot,Gyne_Brain_Bb,by=0,all.x=TRUE)
+
+Gyne_Ovary_Bb <- Gyne.Ovary.pBBvpBL.qlf.TT$table[,c(1,2,5)]
+colnames(Gyne_Ovary_Bb) <- c("Gyne_Ovary_Bb_logFC","Gyne_Ovary_Bb_logCPM","Gyne_Ovary_Bb_FDR")
+temp <- merge(temp,Gyne_Ovary_Bb,by.x="Row.names",by.y=0,all.x=TRUE)
+
+Worker_Brain_Bb <- Worker.Brain.pBBvpBL.qlf.TT$table[,c(1,2,5)]
+colnames(Worker_Brain_Bb) <- c("Worker_Brain_Bb_logFC","Worker_Brain_Bb_logCPM","Worker_Brain_Bb_FDR")
+temp <- merge(temp,Worker_Brain_Bb,by.x="Row.names",by.y=0,all.x=TRUE)
+
+Worker_Gaster_Bb <- Worker.Gaster.pBBvpBL.qlf.TT$table[,c(1,2,5)]
+colnames(Worker_Gaster_Bb) <- c("Worker_Gaster_Bb_logFC","Worker_Gaster_Bb_logCPM","Worker_Gaster_Bb_FDR")
+temp <- merge(temp,Worker_Gaster_Bb,by.x="Row.names",by.y=0,all.x=TRUE)
+
+## Indirect Effect
+Gyne_Brain_SF <- Gyne.Brain.MvP_BB.qlf.TT$table[,c(1,2,5)]
+colnames(Gyne_Brain_SF) <- c("Gyne_Brain_SF_logFC","Gyne_Brain_SF_logCPM","Gyne_Brain_SF_FDR")
+temp <- merge(temp,Gyne_Brain_SF,by.x="Row.names",by.y=0,all.x=TRUE)
+
+Gyne_Ovary_SF <- Gyne.Ovary.MvP_BB.qlf.TT$table[,c(1,2,5)]
+colnames(Gyne_Ovary_SF) <- c("Gyne_Ovary_SF_logFC","Gyne_Ovary_SF_logCPM","Gyne_Ovary_SF_FDR")
+temp <- merge(temp,Gyne_Ovary_SF,by.x="Row.names",by.y=0,all.x=TRUE)
+
+Worker_Brain_SF <- Worker.Brain.MvP_BB.qlf.TT$table[,c(1,2,5)]
+colnames(Worker_Brain_SF) <- c("Worker_Brain_SF_logFC","Worker_Brain_SF_logCPM","Worker_Brain_SF_FDR")
+temp <- merge(temp,Worker_Brain_SF,by.x="Row.names",by.y=0,all.x=TRUE)
+
+Worker_Gaster_SF <- Worker.Gaster.MvP_BB.qlf.TT$table[,c(1,2,5)]
+colnames(Worker_Gaster_SF) <- c("Worker_Gaster_SF_logFC","Worker_Gaster_SF_logCPM","Worker_Gaster_SF_FDR")
+temp <- merge(temp,Worker_Gaster_SF,by.x="Row.names",by.y=0,all.x=TRUE)
+
+## Cross Foster
+Worker_Brain_MvCF <- Worker.Brain.MvCF_BB.qlf.TT$table[,c(1,2,5)]
+colnames(Worker_Brain_MvCF) <- c("Worker_Brain_MvCF_logFC","Worker_Brain_MvCF_logCPM","Worker_Brain_MvCF_FDR")
+temp <- merge(temp,Worker_Brain_MvCF,by.x="Row.names",by.y=0,all.x=TRUE)
+
+Worker_Gaster_MvCF <- Worker.Gaster.MvCF_BB.qlf.TT$table[,c(1,2,5)]
+colnames(Worker_Gaster_MvCF) <- c("Worker_Gaster_MvCF_logFC","Worker_Gaster_MvCF_logCPM","Worker_Gaster_MvCF_FDR")
+temp <- merge(temp,Worker_Gaster_MvCF,by.x="Row.names",by.y=0,all.x=TRUE)
+
+Worker_Brain_CFvP <- Worker.Brain.CFvP_BB.qlf.TT$table[,c(1,2,5)]
+colnames(Worker_Brain_CFvP) <- c("Worker_Brain_CFvP_logFC","Worker_Brain_CFvP_logCPM","Worker_Brain_CFvP_FDR")
+temp <- merge(temp,Worker_Brain_CFvP,by.x="Row.names",by.y=0,all.x=TRUE)
+
+Worker_Gaster_CFvP <- Worker.Gaster.CFvP_BB.qlf.TT$table[,c(1,2,5)]
+colnames(Worker_Gaster_CFvP) <- c("Worker_Gaster_CFvP_logFC","Worker_Gaster_CFvP_logCPM","Worker_Gaster_CFvP_FDR")
+temp <- merge(temp,Worker_Gaster_CFvP,by.x="Row.names",by.y=0,all.x=TRUE)
+
+## Direct+Indirect Effect
+Gyne_Brain_DI <- Gyne.Brain.mBBvpBL.qlf.TT$table[,c(1,2,5)]
+colnames(Gyne_Brain_DI) <- c("Gyne_Brain_DI_logFC","Gyne_Brain_DI_logCPM","Gyne_Brain_DI_FDR")
+temp <- merge(temp,Gyne_Brain_DI,by.x="Row.names",by.y=0,all.x=TRUE)
+
+Gyne_Ovary_DI <- Gyne.Ovary.mBBvpBL.qlf.TT$table[,c(1,2,5)]
+colnames(Gyne_Ovary_DI) <- c("Gyne_Ovary_DI_logFC","Gyne_Ovary_DI_logCPM","Gyne_Ovary_DI_FDR")
+temp <- merge(temp,Gyne_Ovary_DI,by.x="Row.names",by.y=0,all.x=TRUE)
+
+Worker_Brain_DI <- Worker.Brain.mBBvpBL.qlf.TT$table[,c(1,2,5)]
+colnames(Worker_Brain_DI) <- c("Worker_Brain_DI_logFC","Worker_Brain_DI_logCPM","Worker_Brain_DI_FDR")
+temp <- merge(temp,Worker_Brain_DI,by.x="Row.names",by.y=0,all.x=TRUE)
+
+Worker_Gaster_DI <- Worker.Gaster.mBBvpBL.qlf.TT$table[,c(1,2,5)]
+colnames(Worker_Gaster_DI) <- c("Worker_Gaster_DI_logFC","Worker_Gaster_DI_logCPM","Worker_Gaster_DI_FDR")
+temp <- merge(temp,Worker_Gaster_DI,by.x="Row.names",by.y=0,all.x=TRUE)
+
+## GLM Comparisons
+DE_GLM <- glm.DE_TT$table[,c(1,2,5)]
+colnames(DE_GLM) <- c("GLM_DirectEffect_logFC","GLM_DirectEffect_logCPM","GLM_DirectEffect_FDR")
+temp <- merge(temp,DE_GLM,by.x="Row.names",by.y=0,all.x=TRUE)
+
+IDE_GLM <- glm.IDE_TT$table[,c(1,2,5)]
+colnames(IDE_GLM) <- c("GLM_IndirectEffect_logFC","GLM_IndirectEffect_logCPM","GLM_IndirectEffect_FDR")
+All_Data_merge <- merge(temp,IDE_GLM,by.x="Row.names",by.y=0,all.x=TRUE)
+
+rm(temp)
+write.table(All_Data_merge,file = "~/Desktop/CasteRNA_analysis/Results_v6/All_Data_merge_new.tsv",quote = F,sep = "\t",row.names = F)
+
+## Check for insignificant directionality conservation
+
+dir_check1 <- All_Data_merge[(All_Data_merge$Worker_Gaster_Bb_FDR<=0.1),c("Row.names","Worker_Brain_Bb_logFC","Worker_Brain_Bb_FDR","Worker_Gaster_Bb_logFC","Worker_Gaster_Bb_FDR")]
+dir_check1 <- dir_check1[!is.na(dir_check1$Worker_Gaster_Bb_FDR),]
+dir_check1_same <- dir_check1[dir_check1$Worker_Brain_Bb_logFC*dir_check1$Worker_Gaster_Bb_logFC>0,]
+dir_check1_same <- dir_check1_same[!is.na(dir_check1_same$Worker_Gaster_Bb_FDR),] ## 59 Genes
+
+dir_check1_diff <- dir_check1[dir_check1$Worker_Brain_Bb_logFC*dir_check1$Worker_Gaster_Bb_logFC<0,]
+dir_check1_diff <- dir_check1_diff[!is.na(dir_check1_diff$Worker_Gaster_Bb_FDR),] ## 6 Genes
+
+nrow(dir_check1[is.na(dir_check1$Worker_Brain_Bb_FDR),]) ## 21
+
+
+dir_check2 <- All_Data_merge[(All_Data_merge$Worker_Brain_Bb_FDR<=0.1),c("Row.names","Worker_Brain_Bb_logFC","Worker_Brain_Bb_FDR","Worker_Gaster_Bb_logFC","Worker_Gaster_Bb_FDR")]
+dir_check2 <- dir_check2[!is.na(dir_check2$Worker_Brain_Bb_FDR),]
+dir_check2_same <- dir_check2[dir_check2$Worker_Brain_Bb_logFC*dir_check2$Worker_Gaster_Bb_logFC>0,]
+dir_check2_same <- dir_check2_same[!is.na(dir_check2_same$Worker_Gaster_Bb_FDR),] ## 48 Genes
+
+dir_check2_diff <- dir_check2[dir_check2$Worker_Brain_Bb_logFC*dir_check2$Worker_Gaster_Bb_logFC<0,]
+dir_check2_diff <- dir_check2_diff[!is.na(dir_check2_diff$Worker_Gaster_Bb_FDR),] ## 14 Genes
+
+nrow(dir_check2[is.na(dir_check2$Worker_Gaster_Bb_FDR),]) ## 9
+
+dir_check3 <- All_Data_merge[(All_Data_merge$Worker_Gaster_SF_FDR<=0.1),c("Row.names","Worker_Brain_SF_logFC","Worker_Brain_SF_FDR","Worker_Gaster_SF_logFC","Worker_Gaster_SF_FDR")]
+dir_check3 <- dir_check3[!is.na(dir_check3$Worker_Gaster_SF_FDR),]
+dir_check3_same <- dir_check3[dir_check3$Worker_Brain_SF_logFC*dir_check3$Worker_Gaster_SF_logFC>0,]
+dir_check3_same <- dir_check3_same[!is.na(dir_check3_same$Worker_Gaster_SF_FDR),] ## 90 Genes
+
+dir_check3_diff <- dir_check3[dir_check3$Worker_Brain_SF_logFC*dir_check3$Worker_Gaster_SF_logFC<0,]
+dir_check3_diff <- dir_check3_diff[!is.na(dir_check3_diff$Worker_Gaster_SF_FDR),] ## 32 Genes
+
+nrow(dir_check3[is.na(dir_check3$Worker_Brain_SF_FDR),]) ## 17
+
+```
+
+## DE severity test
+```{R Severe}
+
+compare_severity <- function(TT_1,TT_2,sig_level){
+  TT_1_int <- topTags(TT_1,p.value = sig_level,n=Inf)$table
+  TT_2_int <- topTags(TT_2,p.value = sig_level,n=Inf)$table
+  
+  TT_1_sev <- abs(TT_1_int$logFC)
+  TT_2_sev <- abs(TT_2_int$logFC)
+  
+  t.test(TT_1_sev,TT_2_sev)
+}
+
+## Gyne Brain pBBvpBL vs IDE
+compare_severity(Gyne.Brain.pBBvpBL.qlf,Gyne.Brain.MvP_BB.qlf,0.1) # ~ >
+compare_severity(Gyne.Brain.pBBvpBL.qlf,Gyne.Ovary.MvP_BB.qlf,0.1) # ** >
+#compare_severity(Gyne.Brain.pBBvpBL.qlf,Worker.Brain.MvP_BB.qlf,0.1) # NA
+compare_severity(Gyne.Brain.pBBvpBL.qlf,Worker.Gaster.MvP_BB.qlf,0.1) # ** >
+
+## Gyne Ovary pBBvpBL vs IDE
+compare_severity(Gyne.Ovary.pBBvpBL.qlf,Gyne.Brain.MvP_BB.qlf,0.1) # Insig, 
+compare_severity(Gyne.Ovary.pBBvpBL.qlf,Gyne.Ovary.MvP_BB.qlf,0.1) # ** >
+# compare_severity(Gyne.Ovary.pBBvpBL.qlf,Worker.Brain.MvP_BB.qlf,0.1) # NA
+compare_severity(Gyne.Ovary.pBBvpBL.qlf,Worker.Gaster.MvP_BB.qlf,0.1) # ** >
+
+## Worker Brain pBBvpBL vs IDE
+compare_severity(Worker.Brain.pBBvpBL.qlf,Gyne.Brain.MvP_BB.qlf,0.1) # Insig
+compare_severity(Worker.Brain.pBBvpBL.qlf,Gyne.Ovary.MvP_BB.qlf,0.1) # ** >
+#compare_severity(Worker.Brain.pBBvpBL.qlf,Worker.Brain.MvP_BB.qlf,0.1) # NA
+compare_severity(Worker.Brain.pBBvpBL.qlf,Worker.Gaster.MvP_BB.qlf,0.1) # ** >
+
+## Worker Gaster pBBvpBL vs IDE
+compare_severity(Worker.Gaster.pBBvpBL.qlf,Gyne.Brain.MvP_BB.qlf,0.1) # Insig
+compare_severity(Worker.Gaster.pBBvpBL.qlf,Gyne.Ovary.MvP_BB.qlf,0.1) # ** >
+#compare_severity(Worker.Gaster.pBBvpBL.qlf,Worker.Brain.MvP_BB.qlf,0.1) # NA
+compare_severity(Worker.Gaster.pBBvpBL.qlf,Worker.Gaster.MvP_BB.qlf,0.1) # ** >
+
+compare_severity(glm.DE,glm.IDE,0.1) # ** DE > IDE
+
+
+```
+
+
+## Variance Analysis by sample type
+```{R Var_Test}
+
+## Note, by using x1, I am generating the variance plot before coverage filtration. This might be troublsome. Might need to treat them all seperately 
+full_CPM_nolog <- cpm(x1,log = F)
+
+## Compute the CV and sample specific CPM for all DE and IDE genes for all sample types Export to be made into plots in Prism
+IDE.genes <- row.names(topTags(glm.IDE_TT,n=Inf,p.value = 0.1)$table)
+DE.genes <- row.names(topTags(glm.DE_TT,n=Inf,p.value = 0.1)$table)
+
+### The CPM Values
+gyne.brain.mBB.all.cpm <- rowMeans(full_CPM_nolog[,adv_group$pw_tag=="Gyne.Brain.Monogyne.No.BB"])
+gyne.brain.mBB.all.cpm.DE <- gyne.brain.mBB.all.cpm[DE.genes]
+gyne.brain.mBB.all.cpm.IDE <- gyne.brain.mBB.all.cpm[IDE.genes]
+
+gyne.brain.pBB.all.cpm <- rowMeans(full_CPM_nolog[,adv_group$pw_tag=="Gyne.Brain.Polygyne.No.BB"])
+gyne.brain.pBB.all.cpm.DE <- gyne.brain.pBB.all.cpm[DE.genes]
+gyne.brain.pBB.all.cpm.IDE <- gyne.brain.pBB.all.cpm[IDE.genes]
+
+gyne.brain.pBL.all.cpm <- rowMeans(full_CPM_nolog[,adv_group$pw_tag=="Gyne.Brain.Polygyne.No.BL"])
+gyne.brain.pBL.all.cpm.DE <- gyne.brain.pBL.all.cpm[DE.genes]
+gyne.brain.pBL.all.cpm.IDE <- gyne.brain.pBL.all.cpm[IDE.genes]
+
+gyne.ovary.mBB.all.cpm <- rowMeans(full_CPM_nolog[,adv_group$pw_tag=="Gyne.Ovary.Monogyne.No.BB"])
+gyne.ovary.mBB.all.cpm.DE <- gyne.ovary.mBB.all.cpm[DE.genes]
+gyne.ovary.mBB.all.cpm.IDE <- gyne.ovary.mBB.all.cpm[IDE.genes]
+
+gyne.ovary.pBB.all.cpm <- rowMeans(full_CPM_nolog[,adv_group$pw_tag=="Gyne.Ovary.Polygyne.No.BB"])
+gyne.ovary.pBB.all.cpm.DE <- gyne.ovary.pBB.all.cpm[DE.genes]
+gyne.ovary.pBB.all.cpm.IDE <- gyne.ovary.pBB.all.cpm[IDE.genes]
+
+gyne.ovary.pBL.all.cpm <- rowMeans(full_CPM_nolog[,adv_group$pw_tag=="Gyne.Ovary.Polygyne.No.BL"])
+gyne.ovary.pBL.all.cpm.DE <- gyne.ovary.pBL.all.cpm[DE.genes]
+gyne.ovary.pBL.all.cpm.IDE <- gyne.ovary.pBL.all.cpm[IDE.genes]
+
+
+worker.brain.mBB.all.cpm <- rowMeans(full_CPM_nolog[,adv_group$pw_tag=="Worker.Brain.Monogyne.No.BB"])
+worker.brain.mBB.all.cpm.DE <- worker.brain.mBB.all.cpm[DE.genes]
+worker.brain.mBB.all.cpm.IDE <- worker.brain.mBB.all.cpm[IDE.genes]
+
+worker.brain.pBB.all.cpm <- rowMeans(full_CPM_nolog[,adv_group$pw_tag=="Worker.Brain.Polygyne.No.BB"])
+worker.brain.pBB.all.cpm.DE <- worker.brain.pBB.all.cpm[DE.genes]
+worker.brain.pBB.all.cpm.IDE <- worker.brain.pBB.all.cpm[IDE.genes]
+
+worker.brain.pBL.all.cpm <- rowMeans(full_CPM_nolog[,adv_group$pw_tag=="Worker.Brain.Polygyne.No.BL"])
+worker.brain.pBL.all.cpm.DE <- worker.brain.pBL.all.cpm[DE.genes]
+worker.brain.pBL.all.cpm.IDE <- worker.brain.pBL.all.cpm[IDE.genes]
+
+worker.gaster.mBB.all.cpm <- rowMeans(full_CPM_nolog[,adv_group$pw_tag=="Worker.Gaster.Monogyne.No.BB"])
+worker.gaster.mBB.all.cpm.DE <- worker.gaster.mBB.all.cpm[DE.genes]
+worker.gaster.mBB.all.cpm.IDE <- worker.gaster.mBB.all.cpm[IDE.genes]
+
+worker.gaster.pBB.all.cpm <- rowMeans(full_CPM_nolog[,adv_group$pw_tag=="Worker.Gaster.Polygyne.No.BB"])
+worker.gaster.pBB.all.cpm.DE <- worker.gaster.pBB.all.cpm[DE.genes]
+worker.gaster.pBB.all.cpm.IDE <- worker.gaster.pBB.all.cpm[IDE.genes]
+
+worker.gaster.pBL.all.cpm <- rowMeans(full_CPM_nolog[,adv_group$pw_tag=="Worker.Gaster.Polygyne.No.BL"])
+worker.gaster.pBL.all.cpm.DE <- worker.gaster.pBL.all.cpm[DE.genes]
+worker.gaster.pBL.all.cpm.IDE <- worker.gaster.pBL.all.cpm[IDE.genes]
+
+### The CV Values
+gyne.brain.mBB.all.cv <- rowSds(full_CPM_nolog[,adv_group$pw_tag=="Gyne.Brain.Monogyne.No.BB"])/rowMeans(full_CPM_nolog[,adv_group$pw_tag=="Gyne.Brain.Monogyne.No.BB"])
+gyne.brain.mBB.all.cv.DE <- gyne.brain.mBB.all.cv[DE.genes]
+gyne.brain.mBB.all.cv.IDE <- gyne.brain.mBB.all.cv[IDE.genes]
+
+gyne.brain.pBB.all.cv <- rowSds(full_CPM_nolog[,adv_group$pw_tag=="Gyne.Brain.Polygyne.No.BB"])/rowMeans(full_CPM_nolog[,adv_group$pw_tag=="Gyne.Brain.Polygyne.No.BB"])
+gyne.brain.pBB.all.cv.DE <- gyne.brain.pBB.all.cv[DE.genes]
+gyne.brain.pBB.all.cv.IDE <- gyne.brain.pBB.all.cv[IDE.genes]
+
+gyne.brain.pBL.all.cv <- rowSds(full_CPM_nolog[,adv_group$pw_tag=="Gyne.Brain.Polygyne.No.BL"])/rowMeans(full_CPM_nolog[,adv_group$pw_tag=="Gyne.Brain.Polygyne.No.BL"])
+gyne.brain.pBL.all.cv.DE <- gyne.brain.pBL.all.cv[DE.genes]
+gyne.brain.pBL.all.cv.IDE <- gyne.brain.pBL.all.cv[IDE.genes]
+
+gyne.ovary.mBB.all.cv <- rowSds(full_CPM_nolog[,adv_group$pw_tag=="Gyne.Ovary.Monogyne.No.BB"])/rowMeans(full_CPM_nolog[,adv_group$pw_tag=="Gyne.Ovary.Monogyne.No.BB"])
+gyne.ovary.mBB.all.cv.DE <- gyne.ovary.mBB.all.cv[DE.genes]
+gyne.ovary.mBB.all.cv.IDE <- gyne.ovary.mBB.all.cv[IDE.genes]
+
+gyne.ovary.pBB.all.cv <- rowSds(full_CPM_nolog[,adv_group$pw_tag=="Gyne.Ovary.Polygyne.No.BB"])/rowMeans(full_CPM_nolog[,adv_group$pw_tag=="Gyne.Ovary.Polygyne.No.BB"])
+gyne.ovary.pBB.all.cv.DE <- gyne.ovary.pBB.all.cv[DE.genes]
+gyne.ovary.pBB.all.cv.IDE <- gyne.ovary.pBB.all.cv[IDE.genes]
+
+gyne.ovary.pBL.all.cv <- rowSds(full_CPM_nolog[,adv_group$pw_tag=="Gyne.Ovary.Polygyne.No.BL"])/rowMeans(full_CPM_nolog[,adv_group$pw_tag=="Gyne.Ovary.Polygyne.No.BL"])
+gyne.ovary.pBL.all.cv.DE <- gyne.ovary.pBL.all.cv[DE.genes]
+gyne.ovary.pBL.all.cv.IDE <- gyne.ovary.pBL.all.cv[IDE.genes]
+
+
+worker.brain.mBB.all.cv <- rowSds(full_CPM_nolog[,adv_group$pw_tag=="Worker.Brain.Monogyne.No.BB"])/rowMeans(full_CPM_nolog[,adv_group$pw_tag=="Worker.Brain.Monogyne.No.BB"])
+worker.brain.mBB.all.cv.DE <- worker.brain.mBB.all.cv[DE.genes]
+worker.brain.mBB.all.cv.IDE <- worker.brain.mBB.all.cv[IDE.genes]
+
+worker.brain.pBB.all.cv <- rowSds(full_CPM_nolog[,adv_group$pw_tag=="Worker.Brain.Polygyne.No.BB"])/rowMeans(full_CPM_nolog[,adv_group$pw_tag=="Worker.Brain.Polygyne.No.BB"])
+worker.brain.pBB.all.cv.DE <- worker.brain.pBB.all.cv[DE.genes]
+worker.brain.pBB.all.cv.IDE <- worker.brain.pBB.all.cv[IDE.genes]
+
+worker.brain.pBL.all.cv <- rowSds(full_CPM_nolog[,adv_group$pw_tag=="Worker.Brain.Polygyne.No.BL"])/rowMeans(full_CPM_nolog[,adv_group$pw_tag=="Worker.Brain.Polygyne.No.BL"])
+worker.brain.pBL.all.cv.DE <- worker.brain.pBL.all.cv[DE.genes]
+worker.brain.pBL.all.cv.IDE <- worker.brain.pBL.all.cv[IDE.genes]
+
+worker.gaster.mBB.all.cv <- rowSds(full_CPM_nolog[,adv_group$pw_tag=="Worker.Gaster.Monogyne.No.BB"])/rowMeans(full_CPM_nolog[,adv_group$pw_tag=="Worker.Gaster.Monogyne.No.BB"])
+worker.gaster.mBB.all.cv.DE <- worker.gaster.mBB.all.cv[DE.genes]
+worker.gaster.mBB.all.cv.IDE <- worker.gaster.mBB.all.cv[IDE.genes]
+
+worker.gaster.pBB.all.cv <- rowSds(full_CPM_nolog[,adv_group$pw_tag=="Worker.Gaster.Polygyne.No.BB"])/rowMeans(full_CPM_nolog[,adv_group$pw_tag=="Worker.Gaster.Polygyne.No.BB"])
+worker.gaster.pBB.all.cv.DE <- worker.gaster.pBB.all.cv[DE.genes]
+worker.gaster.pBB.all.cv.IDE <- worker.gaster.pBB.all.cv[IDE.genes]
+
+worker.gaster.pBL.all.cv <- rowSds(full_CPM_nolog[,adv_group$pw_tag=="Worker.Gaster.Polygyne.No.BL"])/rowMeans(full_CPM_nolog[,adv_group$pw_tag=="Worker.Gaster.Polygyne.No.BL"])
+worker.gaster.pBL.all.cv.DE <- worker.gaster.pBL.all.cv[DE.genes]
+worker.gaster.pBL.all.cv.IDE <- worker.gaster.pBL.all.cv[IDE.genes]
+
+## Output to text
+write.csv(gyne.brain.mBB.all.cpm.DE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/gyne.brain.mBB.cpm.DE",col.names = F,row.names = F,quote = F)
+write.csv(gyne.brain.pBB.all.cpm.DE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/gyne.brain.pBB.cpm.DE",col.names = F,row.names = F,quote = F)
+write.csv(gyne.brain.pBL.all.cpm.DE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/gyne.brain.pBL.cpm.DE",col.names = F,row.names = F,quote = F)
+
+write.csv(gyne.ovary.mBB.all.cpm.DE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/gyne.ovary.mBB.cpm.DE",col.names = F,row.names = F,quote = F)
+write.csv(gyne.ovary.pBB.all.cpm.DE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/gyne.ovary.pBB.cpm.DE",col.names = F,row.names = F,quote = F)
+write.csv(gyne.ovary.pBL.all.cpm.DE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/gyne.ovary.pBL.cpm.DE",col.names = F,row.names = F,quote = F)
+
+write.csv(worker.brain.mBB.all.cpm.DE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/worker.brain.mBB.cpm.DE",col.names = F,row.names = F,quote = F)
+write.csv(worker.brain.pBB.all.cpm.DE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/worker.brain.pBB.cpm.DE",col.names = F,row.names = F,quote = F)
+write.csv(worker.brain.pBL.all.cpm.DE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/worker.brain.pBL.cpm.DE",col.names = F,row.names = F,quote = F)
+
+write.csv(worker.gaster.mBB.all.cpm.DE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/worker.gaster.mBB.cpm.DE",col.names = F,row.names = F,quote = F)
+write.csv(worker.gaster.pBB.all.cpm.DE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/worker.gaster.pBB.cpm.DE",col.names = F,row.names = F,quote = F)
+write.csv(worker.gaster.pBL.all.cpm.DE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/worker.gaster.pBL.cpm.DE",col.names = F,row.names = F,quote = F)
+
+write.csv(gyne.brain.mBB.all.cv.DE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/gyne.brain.mBB.cv.DE",col.names = F,row.names = F,quote = F)
+write.csv(gyne.brain.pBB.all.cv.DE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/gyne.brain.pBB.cv.DE",col.names = F,row.names = F,quote = F)
+write.csv(gyne.brain.pBL.all.cv.DE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/gyne.brain.pBL.cv.DE",col.names = F,row.names = F,quote = F)
+
+write.csv(gyne.ovary.mBB.all.cv.DE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/gyne.ovary.mBB.cv.DE",col.names = F,row.names = F,quote = F)
+write.csv(gyne.ovary.pBB.all.cv.DE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/gyne.ovary.pBB.cv.DE",col.names = F,row.names = F,quote = F)
+write.csv(gyne.ovary.pBL.all.cv.DE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/gyne.ovary.pBL.cv.DE",col.names = F,row.names = F,quote = F)
+
+write.csv(worker.brain.mBB.all.cv.DE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/worker.brain.mBB.cv.DE",col.names = F,row.names = F,quote = F)
+write.csv(worker.brain.pBB.all.cv.DE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/worker.brain.pBB.cv.DE",col.names = F,row.names = F,quote = F)
+write.csv(worker.brain.pBL.all.cv.DE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/worker.brain.pBL.cv.DE",col.names = F,row.names = F,quote = F)
+
+write.csv(worker.gaster.mBB.all.cv.DE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/worker.gaster.mBB.cv.DE",col.names = F,row.names = F,quote = F)
+write.csv(worker.gaster.pBB.all.cv.DE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/worker.gaster.pBB.cv.DE",col.names = F,row.names = F,quote = F)
+write.csv(worker.gaster.pBL.all.cv.DE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/worker.gaster.pBL.cv.DE",col.names = F,row.names = F,quote = F)
+
+
+write.csv(gyne.brain.mBB.all.cpm.IDE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/gyne.brain.mBB.cpm.IDE",col.names = F,row.names = F,quote = F)
+write.csv(gyne.brain.pBB.all.cpm.IDE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/gyne.brain.pBB.cpm.IDE",col.names = F,row.names = F,quote = F)
+write.csv(gyne.brain.pBL.all.cpm.IDE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/gyne.brain.pBL.cpm.IDE",col.names = F,row.names = F,quote = F)
+
+write.csv(gyne.ovary.mBB.all.cpm.IDE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/gyne.ovary.mBB.cpm.IDE",col.names = F,row.names = F,quote = F)
+write.csv(gyne.ovary.pBB.all.cpm.IDE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/gyne.ovary.pBB.cpm.IDE",col.names = F,row.names = F,quote = F)
+write.csv(gyne.ovary.pBL.all.cpm.IDE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/gyne.ovary.pBL.cpm.IDE",col.names = F,row.names = F,quote = F)
+
+write.csv(worker.brain.mBB.all.cpm.IDE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/worker.brain.mBB.cpm.IDE",col.names = F,row.names = F,quote = F)
+write.csv(worker.brain.pBB.all.cpm.IDE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/worker.brain.pBB.cpm.IDE",col.names = F,row.names = F,quote = F)
+write.csv(worker.brain.pBL.all.cpm.IDE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/worker.brain.pBL.cpm.IDE",col.names = F,row.names = F,quote = F)
+
+write.csv(worker.gaster.mBB.all.cpm.IDE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/worker.gaster.mBB.cpm.IDE",col.names = F,row.names = F,quote = F)
+write.csv(worker.gaster.pBB.all.cpm.IDE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/worker.gaster.pBB.cpm.IDE",col.names = F,row.names = F,quote = F)
+write.csv(worker.gaster.pBL.all.cpm.IDE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/worker.gaster.pBL.cpm.IDE",col.names = F,row.names = F,quote = F)
+
+write.csv(gyne.brain.mBB.all.cv.IDE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/gyne.brain.mBB.cv.IDE",col.names = F,row.names = F,quote = F)
+write.csv(gyne.brain.pBB.all.cv.IDE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/gyne.brain.pBB.cv.IDE",col.names = F,row.names = F,quote = F)
+write.csv(gyne.brain.pBL.all.cv.IDE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/gyne.brain.pBL.cv.IDE",col.names = F,row.names = F,quote = F)
+
+write.csv(gyne.ovary.mBB.all.cv.IDE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/gyne.ovary.mBB.cv.IDE",col.names = F,row.names = F,quote = F)
+write.csv(gyne.ovary.pBB.all.cv.IDE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/gyne.ovary.pBB.cv.IDE",col.names = F,row.names = F,quote = F)
+write.csv(gyne.ovary.pBL.all.cv.IDE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/gyne.ovary.pBL.cv.IDE",col.names = F,row.names = F,quote = F)
+
+write.csv(worker.brain.mBB.all.cv.IDE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/worker.brain.mBB.cv.IDE",col.names = F,row.names = F,quote = F)
+write.csv(worker.brain.pBB.all.cv.IDE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/worker.brain.pBB.cv.IDE",col.names = F,row.names = F,quote = F)
+write.csv(worker.brain.pBL.all.cv.IDE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/worker.brain.pBL.cv.IDE",col.names = F,row.names = F,quote = F)
+
+write.csv(worker.gaster.mBB.all.cv.IDE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/worker.gaster.mBB.cv.IDE",col.names = F,row.names = F,quote = F)
+write.csv(worker.gaster.pBB.all.cv.IDE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/worker.gaster.pBB.cv.IDE",col.names = F,row.names = F,quote = F)
+write.csv(worker.gaster.pBL.all.cv.IDE,file="~/Desktop/CasteRNA_analysis/Results_v6/CV_Diff/worker.gaster.pBL.cv.IDE",col.names = F,row.names = F,quote = F)
+
+```
+## Venn Overlap of DE and IDE
+```{R DE_IDE_overlap}
+DE_IDE_1 <- list(GLM.DE.sig=glm.DE.sig.merge$gene,
+                 GLM.IDE.sig=glm.IDE.sig.merge$gene
+                 )
+
+pdf("~/Desktop/CasteRNA_analysis/Results_v6/DE_IDE.Venn.1.pdf",height = 5,width=5,useDingbats = F,onefile = F)
+plot(venn(DE_IDE_1))
+dev.off()
+
+over_rep <- function(DE1,DE2){
+  DE1_tested <- row.names(topTags(DE1,n = Inf,p.value = 1)$table)
+  DE2_tested <- row.names(topTags(DE2,n = Inf,p.value = 1)$table)
+  DE1_pre_sig <- row.names(topTags(DE1,n = Inf,p.value = 0.1)$table)
+  DE2_pre_sig <- row.names(topTags(DE2,n = Inf,p.value = 0.1)$table)
+  common_test <- intersect(DE1_tested,DE2_tested)
+  DE1_sig <- DE1_pre_sig[DE1_pre_sig %in% common_test]
+  DE2_sig <- DE2_pre_sig[DE2_pre_sig %in% common_test]
+  both_sig <- intersect(DE1_sig,DE2_sig)
+  DE1_only <- setdiff(DE1_sig,both_sig)
+  DE2_only <- setdiff(DE2_sig,both_sig)
+  neither_sig <- setdiff(common_test,union(DE1_sig,DE2_sig))
+  
+  print(chisq.test(x=matrix(c(length(both_sig),length(DE1_only),length(DE2_only),length(neither_sig)),nrow=2),correct = FALSE)$observed)
+  print(chisq.test(x=matrix(c(length(both_sig),length(DE1_only),length(DE2_only),length(neither_sig)),nrow=2),correct = FALSE)$expected)
+  print(chisq.test(x=matrix(c(length(both_sig),length(DE1_only),length(DE2_only),length(neither_sig)),nrow=2),correct = FALSE))
+  print(fisher.test(x=matrix(c(length(both_sig),length(DE1_only),length(DE2_only),length(neither_sig)),nrow=2),alternative = "two.sided"))
+  print(both_sig)
+  DE1_DE2_list <- list(DE1.sig=DE1_sig,
+                 DE2.sig=DE2_sig
+                 )
+  return(venn(DE1_DE2_list))
+}
+
+glm_venn <- over_rep(glm.DE,glm.IDE)
+glm_overlap.sig <- glm.DE.sig.merge[glm.DE.sig.merge$gene %in% c("SINVBB1_13051","SINVBB1_13687","SINVBB1_10274","SINVBB1_06176","SINVBB1_15504","SINVBB1_15661","SINVBB1_07367","SINVBB1_05094","SINVBB1_14039","SINVBB1_02973","SINVBB1_05246","SINVBB1_04210","SINVBB1_15727","SINVBB1_07845","SINVBB1_09710","SINVBB1_03359","SINVBB1_01960"),]
+
+gyne.brain_venn <- over_rep(Gyne.Brain.pBBvpBL.qlf,Gyne.Brain.MvP_BB.qlf)
+gyne_brain_overlap.sig <- Gyne.Brain.pBBvpBL.qlf.TT.sig.merge[Gyne.Brain.pBBvpBL.qlf.TT.sig.merge$gene %in% c("SINVBB1_13687"),]
+pdf("~/Desktop/CasteRNA_analysis/Results_v6/Gyne_Brain.DE_IDE.Venn.1.pdf",height = 5,width=5,useDingbats = F,onefile = F)
+plot(gyne.brain_venn)
+dev.off()
+
+gyne.ovary_venn <- over_rep(Gyne.Ovary.pBBvpBL.qlf,Gyne.Ovary.MvP_BB.qlf)
+gyne_ovary_overlap.sig <- Gyne.Ovary.pBBvpBL.qlf.TT.sig.merge[Gyne.Ovary.pBBvpBL.qlf.TT.sig.merge$gene %in% c("SINVBB1_01570","SINVBB1_12292","SINVBB1_03742","SINVBB1_11086","SINVBB1_13251a"),]
+
+pdf("~/Desktop/CasteRNA_analysis/Results_v6/Gyne_Ovary.DE_IDE.Venn.1.pdf",height = 5,width=5,useDingbats = F,onefile = F)
+plot(gyne.ovary_venn)
+dev.off()
+
+worker.brain_venn <- over_rep(Worker.Brain.pBBvpBL.qlf,Worker.Brain.MvP_BB.qlf)
+pdf("~/Desktop/CasteRNA_analysis/Results_v6/Worker_Brain.DE_IDE.Venn.1.pdf",height = 5,width=5,useDingbats = F,onefile = F)
+plot(worker.brain_venn)
+dev.off()
+
+worker.gaster_venn <- over_rep(Worker.Gaster.pBBvpBL.qlf,Worker.Gaster.MvP_BB.qlf)
+worker_gaster_overlap.sig <- Worker.Gaster.pBBvpBL.qlf.TT.sig.merge[Worker.Gaster.pBBvpBL.qlf.TT.sig.merge$gene %in% c("SINVBB1_15423","SINVBB1_00481","SINVBB1_07156"),]
+
+
+
+pdf("~/Desktop/CasteRNA_analysis/Results_v6/Worker_Gaster.DE_IDE.Venn.1.pdf",height = 5,width=5,useDingbats = F,onefile = F)
+plot(worker.gaster_venn)
+dev.off()
+
+
+```
+
+
+## Bootstrap analysis of PW DE and IDE overlap
+```{R PW_Bootstrap}
+
+make_bootstrap <- function(DE1,DE2,DE3,DE4){
+  DE1_num <- nrow(topTags(DE1,n=Inf,p.value = 0.1)$table)
+  DE2_num <- nrow(topTags(DE2,n=Inf,p.value = 0.1)$table)
+  DE3_num <- nrow(topTags(DE3,n=Inf,p.value = 0.1)$table)
+  DE4_num <- nrow(topTags(DE4,n=Inf,p.value = 0.1)$table)
+ # print(c(DE1_num, DE2_num, DE3_num,DE4_num))
+  
+  DE1_genes <- row.names(topTags(DE1,n=Inf,p.value = 1)$table)
+  # print(DE1_genes)
+  DE2_genes <- row.names(topTags(DE2,n=Inf,p.value = 1)$table)
+  DE3_genes <- row.names(topTags(DE3,n=Inf,p.value = 1)$table)
+  DE4_genes <- row.names(topTags(DE4,n=Inf,p.value = 1)$table)
+  
+  DE1_subsample <- sample(DE1_genes,DE1_num,replace=F)
+  # print(DE1_subsample)
+  DE2_subsample <- sample(DE2_genes,DE1_num,replace=F)
+  DE3_subsample <- sample(DE3_genes,DE1_num,replace=F)
+  DE4_subsample <- sample(DE4_genes,DE1_num,replace=F)
+  
+  DE_list <- list(DE1 = DE1_subsample,
+                  DE2 = DE2_subsample,
+                  DE3 = DE3_subsample,
+                  DE4 = DE4_subsample)
+  # print(DE_list)
+  
+  DE_venn <- venn(DE_list)
+  num_overlap <- sum(DE_venn$original.values[5:15])
+  return(num_overlap)
+}
+
+bootstraps <- 10000
+DE_results <- rep(0,bootstraps)
+for (i in 1:bootstraps){
+  DE_results[i] <- make_bootstrap(Gyne.Brain.pBBvpBL.qlf,Gyne.Ovary.pBBvpBL.qlf,Worker.Brain.pBBvpBL.qlf,Worker.Gaster.pBBvpBL.qlf)
+}
+
+hist(DE_results)
+
+IDE_results <- rep(0,bootstraps)
+for (i in 1:bootstraps){
+  IDE_results[i] <- make_bootstrap(Gyne.Brain.MvP_BB.qlf,Gyne.Ovary.MvP_BB.qlf,Worker.Brain.MvP_BB.qlf,Worker.Gaster.MvP_BB.qlf)
+}
+
+hist(IDE_results)
+
+sum(venn(DirectEffect_set)$original.values[5:15])
+sum(venn(DirectEffect_set)$original.values[1:4])
+
+sum(venn(SF_1)$original.values[5:15])
+sum(venn(SF_1)$original.values[1:4])
+
+
+```
+## Save the Workspace to share
+```{R End point}
+save.image(file = "CasteRNA_Markdown_v6_05182022.RData")
+sessionInfo()
+
+```
+
+
+
